@@ -5,6 +5,7 @@ use ratatui::{
     Frame,
 };
 
+use super::status::state_dot;
 use super::text::{display_width_u16, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::AppState;
@@ -35,6 +36,37 @@ fn tab_width(ws: &crate::workspace::Workspace, tab_idx: usize) -> u16 {
 
 /// Cap on the activity suffix so a noisy terminal title can't flood the tab.
 const MAX_TAB_ACTIVITY_WIDTH: usize = 20;
+
+/// One entry per detected agent in the tab, in stable pane creation order
+/// (the pane map itself is unordered). Empty when no agent is running in the
+/// tab.
+pub(super) fn tab_agent_dots(
+    ws: &crate::workspace::Workspace,
+    tab_idx: usize,
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+) -> Vec<(crate::layout::PaneId, crate::detect::AgentState, bool)> {
+    let Some(tab) = ws.tabs.get(tab_idx) else {
+        return Vec::new();
+    };
+    let mut panes: Vec<_> = tab.panes.iter().collect();
+    panes.sort_by_key(|(pane_id, _)| {
+        ws.public_pane_numbers
+            .get(pane_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    panes
+        .into_iter()
+        .filter_map(|(pane_id, pane)| {
+            let terminal = terminals.get(&pane.attached_terminal_id)?;
+            terminal.detected_agent.as_ref()?;
+            Some((*pane_id, terminal.state, pane.seen))
+        })
+        .collect()
+}
 
 /// What the tab is currently doing: the detected agent of the focused pane
 /// (then of any pane in the tab), falling back to the focused pane's
@@ -409,24 +441,37 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         };
         // Dim the position prefix so the activity name carries the label.
         let (number, suffix) = tab_label_parts(ws, idx, &app.terminals);
-        let avail = (rect.width as usize).saturating_sub(2);
-        let line = match suffix {
+        // Dots render as " ●" per detected agent after the label, matching
+        // the spaces-bar chips; agent-less tabs end after their label.
+        let dots = tab_agent_dots(ws, idx, &app.terminals);
+        let dots_block_width = dots.len() * 2;
+        let avail = (rect.width as usize).saturating_sub(2 + dots_block_width);
+        let mut spans = match suffix {
             Some(activity) => {
                 let prefix = format!("{number} - ");
                 let activity = truncate_end(
                     &activity,
                     avail.saturating_sub(super::text::display_width(&prefix)),
                 );
-                ratatui::text::Line::from(vec![
+                vec![
                     ratatui::text::Span::styled(prefix, style.add_modifier(Modifier::DIM)),
                     ratatui::text::Span::styled(activity, style),
-                ])
+                ]
             }
-            None => ratatui::text::Line::from(ratatui::text::Span::styled(
+            None => vec![ratatui::text::Span::styled(
                 truncate_end(&number.to_string(), avail),
                 style,
-            )),
+            )],
         };
+        for (_, state, seen) in &dots {
+            spans.push(ratatui::text::Span::styled(" ", style));
+            let (dot, dot_style) = state_dot(*state, *seen, p);
+            spans.push(ratatui::text::Span::styled(
+                dot,
+                dot_style.bg(style.bg.unwrap_or(p.surface0)),
+            ));
+        }
+        let line = ratatui::text::Line::from(spans);
         frame.render_widget(
             Paragraph::new(line)
                 .alignment(Alignment::Center)
@@ -566,6 +611,47 @@ mod tests {
         assert_eq!(
             tab_width(&ws, 0),
             display_width_u16("提交 herdr 的反馈") + 4
+        );
+    }
+
+    #[test]
+    fn tab_bar_shows_state_dot_for_tab_with_agent() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.test_add_tab(None);
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        terminal_state.state = crate::detect::AgentState::Working;
+
+        app.view.tab_bar_rect = Rect::new(0, 0, 40, 1);
+        let view = compute_tab_bar_view(&app.workspaces[0], app.view.tab_bar_rect, 0, true, false);
+        app.view.tab_hit_areas = view.tab_hit_areas;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let agent_tab = app.view.tab_hit_areas[0];
+        let dot_x = (agent_tab.x..agent_tab.x + agent_tab.width)
+            .find(|&x| buffer[(x, 0)].symbol() == "●")
+            .expect("agent tab should show a state dot");
+        assert_eq!(buffer[(dot_x, 0)].style().fg, Some(app.palette.yellow));
+
+        let plain_tab = app.view.tab_hit_areas[1];
+        assert!(
+            (plain_tab.x..plain_tab.x + plain_tab.width).all(|x| buffer[(x, 0)].symbol() != "●"),
+            "agent-less tab should not show a dot"
         );
     }
 

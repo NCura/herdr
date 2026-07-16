@@ -76,24 +76,9 @@ fn agent_dots(
         crate::terminal::TerminalState,
     >,
 ) -> Vec<(crate::layout::PaneId, crate::detect::AgentState, bool)> {
-    let mut dots = Vec::new();
-    for tab in &ws.tabs {
-        let mut panes: Vec<_> = tab.panes.iter().collect();
-        panes.sort_by_key(|(pane_id, _)| {
-            ws.public_pane_numbers
-                .get(pane_id)
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
-        for (pane_id, pane) in panes {
-            if let Some(terminal) = terminals.get(&pane.attached_terminal_id) {
-                if terminal.detected_agent.is_some() {
-                    dots.push((*pane_id, terminal.state, pane.seen));
-                }
-            }
-        }
-    }
-    dots
+    (0..ws.tabs.len())
+        .flat_map(|tab_idx| super::tabs::tab_agent_dots(ws, tab_idx, terminals))
+        .collect()
 }
 
 /// A chip's fully-styled line plus the geometry needed for dot hit-testing.
