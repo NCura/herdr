@@ -43,11 +43,15 @@ install-hooks:
 build:
     cargo build --release --locked
 
-# Fast UI iteration: rebuild and relaunch in the isolated `fleet` session
-# (same config/session as the nix-installed fleet wrapper, no nix rebuild)
+# Fast UI iteration in a sandbox `fleet-dev` session, isolated from the
+# production `fleet` one (own server, socket, and state). Reads the fleet
+# config, unless a fleet-dev config exists to experiment with settings too.
 dev: build
-    target/release/herdr --session fleet server stop 2>/dev/null || true
-    HERDR_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/fleet/config.toml" target/release/herdr --session fleet
+    #!/usr/bin/env bash
+    cfg="${XDG_CONFIG_HOME:-$HOME/.config}/fleet-dev/config.toml"
+    [ -f "$cfg" ] || cfg="${XDG_CONFIG_HOME:-$HOME/.config}/fleet/config.toml"
+    target/release/herdr --session fleet-dev server stop 2>/dev/null || true
+    HERDR_CONFIG_PATH="$cfg" exec target/release/herdr --session fleet-dev
 
 # Build the website and documentation
 website-build:
