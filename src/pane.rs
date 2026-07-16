@@ -2122,11 +2122,10 @@ impl PaneRuntime {
                             };
                             if foreground_name != last_foreground_name {
                                 last_foreground_name = foreground_name.clone();
-                                let _ =
-                                    state_events.try_send(AppEvent::ForegroundProcessChanged {
-                                        pane_id,
-                                        name: foreground_name,
-                                    });
+                                let _ = state_events.try_send(AppEvent::ForegroundProcessChanged {
+                                    pane_id,
+                                    name: foreground_name,
+                                });
                             }
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;

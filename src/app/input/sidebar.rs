@@ -261,8 +261,7 @@ impl AppState {
         let y = if launcher.y >= screen.y + menu_h {
             launcher.y - menu_h
         } else {
-            (launcher.y + launcher.height)
-                .min((screen.y + screen.height).saturating_sub(menu_h))
+            (launcher.y + launcher.height).min((screen.y + screen.height).saturating_sub(menu_h))
         };
         Rect::new(x, y, menu_w, menu_h)
     }

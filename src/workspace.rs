@@ -18,9 +18,9 @@ mod aggregate;
 mod git;
 mod tab;
 
+pub(crate) use self::aggregate::pane_attention_priority;
 #[cfg(test)]
 use self::git::git_ahead_behind;
-pub(crate) use self::aggregate::pane_attention_priority;
 pub(crate) use self::tab::MovedPane;
 pub use self::{
     git::{
@@ -406,7 +406,7 @@ impl Workspace {
                 identity_cwd: initial_cwd.clone(),
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
-            cached_git_dirty: None,
+                cached_git_dirty: None,
                 cached_git_space: None,
                 worktree_space: None,
                 metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),

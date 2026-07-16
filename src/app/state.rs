@@ -777,8 +777,6 @@ pub struct ViewState {
     pub sidebar_rect: Rect,
     /// Horizontal spaces bar at the top (replaces the vertical sidebar).
     pub spaces_bar_rect: Rect,
-    /// Trailing " + " button in the spaces bar (zero when mouse chrome is off).
-    pub new_space_hit_area: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -1787,7 +1785,6 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 spaces_bar_rect: Rect::default(),
-                new_space_hit_area: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),

@@ -313,9 +313,9 @@ pub(crate) fn compute_spaces_bar_areas(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
-) -> (Vec<WorkspaceCardArea>, Rect) {
+) -> Vec<WorkspaceCardArea> {
     if area.width == 0 || area.height == 0 || app.workspaces.is_empty() {
-        return (Vec::new(), Rect::default());
+        return Vec::new();
     }
 
     let count = app.workspaces.len();
@@ -324,13 +324,10 @@ pub(crate) fn compute_spaces_bar_areas(
 
     let naturals: Vec<u16> = (0..count)
         .map(|ws_idx| {
-            build_chip_line(app, terminal_runtimes, ws_idx, u16::MAX)
-                .map_or(0, |line| line.width)
+            build_chip_line(app, terminal_runtimes, ws_idx, u16::MAX).map_or(0, |line| line.width)
         })
         .collect();
-    let total: u16 = naturals
-        .iter()
-        .fold(0u16, |acc, w| acc.saturating_add(*w));
+    let total: u16 = naturals.iter().fold(0u16, |acc, w| acc.saturating_add(*w));
 
     let mut widths = naturals.clone();
     if total <= avail {
@@ -384,8 +381,7 @@ pub(crate) fn compute_spaces_bar_areas(
         x = x.saturating_add(width + 1);
     }
 
-    // The new-space button floats at the top-right of the window now.
-    (cards, Rect::default())
+    cards
 }
 
 /// Column of the drop indicator for a workspace drag: the left edge of the

@@ -224,16 +224,14 @@ pub(super) fn render_menu_launcher(app: &AppState, frame: &mut Frame) {
         let tab_rect = app.new_tab_button_rect();
         if tab_rect.width > 0 {
             frame.render_widget(
-                Paragraph::new(" +tab ")
-                    .style(Style::default().fg(p.overlay0).bg(p.panel_bg)),
+                Paragraph::new(" +tab ").style(Style::default().fg(p.overlay0).bg(p.panel_bg)),
                 tab_rect,
             );
         }
         let space_rect = app.new_space_button_rect();
         if space_rect.width > 0 {
             frame.render_widget(
-                Paragraph::new(" +space ")
-                    .style(Style::default().fg(p.overlay0).bg(p.panel_bg)),
+                Paragraph::new(" +space ").style(Style::default().fg(p.overlay0).bg(p.panel_bg)),
                 space_rect,
             );
         }
@@ -247,10 +245,7 @@ pub(super) fn render_menu_launcher(app: &AppState, frame: &mut Frame) {
             Span::styled("menu ", Style::default().fg(p.overlay0)),
         ])
     } else {
-        Line::from(vec![Span::styled(
-            "menu ",
-            Style::default().fg(p.overlay0),
-        )])
+        Line::from(vec![Span::styled("menu ", Style::default().fg(p.overlay0))])
     };
     frame.render_widget(
         Paragraph::new(line)

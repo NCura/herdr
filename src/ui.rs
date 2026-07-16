@@ -58,8 +58,8 @@ pub(crate) use self::scrollbar::{
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
 use self::settings::render_settings_overlay;
-use self::spaces_bar::{compute_spaces_bar_areas, render_spaces_bar};
 pub(crate) use self::spaces_bar::spaces_bar_agent_dot_at;
+use self::spaces_bar::{compute_spaces_bar_areas, render_spaces_bar};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
@@ -251,8 +251,7 @@ fn compute_view_internal(
         .min(app.workspaces.len().saturating_sub(1));
     app.agent_panel_scroll = 0;
 
-    let (workspace_card_areas, new_space_hit_area) =
-        compute_spaces_bar_areas(app, terminal_runtimes, spaces_bar_area);
+    let workspace_card_areas = compute_spaces_bar_areas(app, terminal_runtimes, spaces_bar_area);
 
     let tab_bar_view = app
         .active
@@ -310,7 +309,6 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         sidebar_rect: Rect::default(),
         spaces_bar_rect: spaces_bar_area,
-        new_space_hit_area,
         workspace_card_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
@@ -384,7 +382,6 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
         spaces_bar_rect: Rect::default(),
-        new_space_hit_area: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),

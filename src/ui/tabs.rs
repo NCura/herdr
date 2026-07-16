@@ -428,7 +428,9 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
             )),
         };
         frame.render_widget(
-            Paragraph::new(line).alignment(Alignment::Center).style(style),
+            Paragraph::new(line)
+                .alignment(Alignment::Center)
+                .style(style),
             rect,
         );
     }

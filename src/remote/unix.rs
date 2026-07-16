@@ -1441,7 +1441,8 @@ fn wait_for_remote_server_shutdown(
 ) -> io::Result<()> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
-        if remote_server_status(ssh, remote_herdr, session_name)? == RemoteServerStatus::NotRunning {
+        if remote_server_status(ssh, remote_herdr, session_name)? == RemoteServerStatus::NotRunning
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
