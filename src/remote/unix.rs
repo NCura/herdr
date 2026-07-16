@@ -824,10 +824,14 @@ fi
     emit "$home/.local/share/mise/installs/herdr/$version/bin/herdr"
     emit "$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr"
     emit "$home/.nix-profile/bin/herdr"
+    emit "$home/.nix-profile/bin/herdr-fleet"
 fi
 if [ -n "$user" ]; then
     emit "/etc/profiles/per-user/$user/bin/herdr"
+    emit "/etc/profiles/per-user/$user/bin/herdr-fleet"
 fi
+emit "/run/current-system/sw/bin/herdr-fleet"
+emit "$(command -v herdr-fleet 2>/dev/null || true)"
 emit "/nix/var/nix/profiles/default/bin/herdr"
 emit "/run/current-system/sw/bin/herdr"
 "#,
