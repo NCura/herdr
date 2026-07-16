@@ -202,7 +202,17 @@ fn desktop_tab_bar_and_terminal_area(
     main_area: Rect,
 ) -> (Rect, Rect) {
     let hide_single_tab_bar = app.hide_tab_bar_when_single_tab && ws.tabs.len() == 1;
-    if !hide_single_tab_bar && main_area.height > 1 {
+    if !hide_single_tab_bar && main_area.height > 2 {
+        // One unpainted row between the pane body and the tab bar as breathing
+        // room; it shows the terminal background.
+        let [terminal_area, _gap, tab_bar_rect] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(main_area);
+        (tab_bar_rect, terminal_area)
+    } else if !hide_single_tab_bar && main_area.height > 1 {
         let [terminal_area, tab_bar_rect] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(main_area);
         (tab_bar_rect, terminal_area)
