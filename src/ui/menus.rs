@@ -211,6 +211,36 @@ pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: R
     }
 }
 
+/// The "menu" launcher, floating at the top-right corner of the window over
+/// whatever pane content is underneath.
+pub(super) fn render_menu_launcher(app: &AppState, frame: &mut Frame) {
+    let rect = app.global_launcher_rect();
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let p = &app.palette;
+    let line = if app.global_menu_attention_badge_visible() {
+        Line::from(vec![
+            Span::styled(
+                "● ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("menu ", Style::default().fg(p.overlay0)),
+        ])
+    } else {
+        Line::from(vec![Span::styled(
+            "menu ",
+            Style::default().fg(p.overlay0),
+        )])
+    };
+    frame.render_widget(
+        Paragraph::new(line)
+            .alignment(Alignment::Right)
+            .style(Style::default().bg(p.panel_bg)),
+        rect,
+    );
+}
+
 pub(super) fn render_global_launcher_menu(app: &AppState, frame: &mut Frame) {
     let rect = app.global_menu_rect();
     let Some(inner) = render_panel_shell(frame, rect, app.palette.accent, app.palette.panel_bg)

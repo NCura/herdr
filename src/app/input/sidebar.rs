@@ -185,9 +185,9 @@ impl AppState {
             return self.view.mobile_menu_hit_area;
         }
 
-        // Far right of the bottom spaces bar row.
-        let bar = self.view.spaces_bar_rect;
-        if bar.width == 0 || bar.height == 0 {
+        // Floating at the top-right corner of the window.
+        let screen = self.screen_rect();
+        if screen.width == 0 || screen.height == 0 {
             return Rect::default();
         }
         let width = if self.global_menu_attention_badge_visible() {
@@ -195,9 +195,9 @@ impl AppState {
         } else {
             6
         }
-        .min(bar.width.max(1));
-        let x = bar.x + bar.width.saturating_sub(width);
-        Rect::new(x, bar.y, width, 1)
+        .min(screen.width.max(1));
+        let x = screen.x + screen.width.saturating_sub(width);
+        Rect::new(x, screen.y, width, 1)
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
@@ -233,7 +233,14 @@ impl AppState {
         let max_x = screen.x + screen.width.saturating_sub(menu_w);
         let desired_x = launcher.x + launcher.width.saturating_sub(menu_w);
         let x = desired_x.min(max_x);
-        let y = launcher.y.saturating_sub(menu_h);
+        // Open above the launcher when there's room (bottom-anchored layouts),
+        // otherwise below it (the launcher floats at the top of the window).
+        let y = if launcher.y >= screen.y + menu_h {
+            launcher.y - menu_h
+        } else {
+            (launcher.y + launcher.height)
+                .min((screen.y + screen.height).saturating_sub(menu_h))
+        };
         Rect::new(x, y, menu_w, menu_h)
     }
 

@@ -1,11 +1,11 @@
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     widgets::Paragraph,
     Frame,
 };
 
-use super::text::display_width_u16;
+use super::text::{display_width_u16, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::AppState;
 
@@ -340,10 +340,12 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         } else {
             Style::default().fg(p.overlay1).bg(p.surface0)
         };
-        let width = rect.width as usize;
         let name = tab_chrome_label(ws, idx);
-        let text = format!(" {:width$}", name, width = width.saturating_sub(1));
-        frame.render_widget(Paragraph::new(text).style(style), rect);
+        let name = truncate_end(&name, (rect.width as usize).saturating_sub(2));
+        frame.render_widget(
+            Paragraph::new(name).alignment(Alignment::Center).style(style),
+            rect,
+        );
     }
 
     if let Some(crate::app::state::DragState {

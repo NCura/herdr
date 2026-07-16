@@ -90,16 +90,7 @@ pub(crate) fn compute_spaces_bar_areas(app: &AppState, area: Rect) -> (Vec<Works
 
     let count = app.workspaces.len() as u16;
     let new_space_reserved = if app.mouse_capture { NEW_SPACE_WIDTH } else { 0 };
-    // The global menu launcher sits at the far right of the bar.
-    let menu_reserved = if app.global_menu_attention_badge_visible() {
-        8
-    } else {
-        6
-    };
-    let avail = area
-        .width
-        .saturating_sub(new_space_reserved)
-        .saturating_sub(menu_reserved);
+    let avail = area.width.saturating_sub(new_space_reserved);
 
     let base = avail / count;
     let extra = avail % count;
@@ -117,7 +108,7 @@ pub(crate) fn compute_spaces_bar_areas(app: &AppState, area: Rect) -> (Vec<Works
     }
 
     let new_space_hit_area = if app.mouse_capture {
-        let chrome_right = (area.x + area.width).saturating_sub(menu_reserved);
+        let chrome_right = area.x + area.width;
         Rect::new(x, area.y, chrome_right.saturating_sub(x).min(NEW_SPACE_WIDTH), 1)
     } else {
         Rect::default()
@@ -250,7 +241,14 @@ pub(super) fn render_spaces_bar(
         }
 
         spans.push(Span::styled(" ", Style::default().bg(bg)));
-        frame.render_widget(Paragraph::new(Line::from(spans)), card.rect);
+        // Paragraph-level style paints the chip background across the full
+        // rect (spans only cover the text); centered so wide chips read well.
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(bg)),
+            card.rect,
+        );
     }
 
     if app.mouse_capture && app.view.new_space_hit_area.width > 0 {
@@ -275,22 +273,4 @@ pub(super) fn render_spaces_bar(
         }
     }
 
-    let menu_rect = app.global_launcher_rect();
-    if menu_rect.width > 0 {
-        let menu_line = if app.global_menu_attention_badge_visible() {
-            Line::from(vec![
-                Span::styled(
-                    "● ",
-                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("menu", Style::default().fg(p.overlay0)),
-            ])
-        } else {
-            Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay0))])
-        };
-        frame.render_widget(
-            Paragraph::new(menu_line).alignment(Alignment::Right),
-            menu_rect,
-        );
-    }
 }
