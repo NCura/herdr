@@ -21,8 +21,9 @@ use crate::terminal::TerminalRuntimeRegistry;
 /// Width reserved for the trailing new-space button (" + ").
 const NEW_SPACE_WIDTH: u16 = 3;
 
-/// Chip chrome around the content: leading pad, state dot, gap, trailing pad.
-const CHIP_CHROME_WIDTH: u16 = 4;
+/// Chip chrome besides the agent dots: leading pad, gap after the dots,
+/// trailing pad. Each agent dot adds one more cell.
+const CHIP_BASE_CHROME_WIDTH: u16 = 3;
 
 /// Branch names longer than this are elided with `…` in the chip.
 const MAX_BRANCH_WIDTH: usize = 11;
@@ -62,6 +63,36 @@ impl ChipGit {
 struct ChipContent {
     name: String,
     git: Option<ChipGit>,
+}
+
+/// One `(state, seen)` entry per detected agent in the workspace, in stable
+/// order (tab order, then pane creation number — the pane map is unordered).
+/// Empty when no agent is running anywhere in the workspace.
+fn agent_dots(
+    ws: &crate::workspace::Workspace,
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+) -> Vec<(crate::detect::AgentState, bool)> {
+    let mut dots = Vec::new();
+    for tab in &ws.tabs {
+        let mut panes: Vec<_> = tab.panes.iter().collect();
+        panes.sort_by_key(|(pane_id, _)| {
+            ws.public_pane_numbers
+                .get(pane_id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        for (_, pane) in panes {
+            if let Some(terminal) = terminals.get(&pane.attached_terminal_id) {
+                if terminal.detected_agent.is_some() {
+                    dots.push((terminal.state, pane.seen));
+                }
+            }
+        }
+    }
+    dots
 }
 
 fn chip_contents(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) -> Vec<ChipContent> {
@@ -179,22 +210,32 @@ pub(super) fn render_spaces_bar(
             })
             .bg(bg);
 
-        let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
-        let (dot, dot_style) = state_dot(agg_state, agg_seen, p);
+        // One dot per running agent; a neutral dot when there are none.
+        let dots = agent_dots(ws, &app.terminals);
+        let dots_width = dots.len().max(1) as u16;
 
         // Fit content into the chip: the name wins, then the dirty marker,
         // then the ahead/behind counters; the branch shrinks or drops first.
-        let content_budget = card.rect.width.saturating_sub(CHIP_CHROME_WIDTH) as usize;
+        let content_budget = card
+            .rect
+            .width
+            .saturating_sub(CHIP_BASE_CHROME_WIDTH + dots_width) as usize;
         let name = truncate_end(&content.name, content_budget);
         let mut budget =
             content_budget.saturating_sub(display_width_u16(&name) as usize);
 
-        let mut spans = vec![
-            Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(dot, dot_style.bg(bg)),
-            Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(name, name_style),
-        ];
+        let mut spans = vec![Span::styled(" ", Style::default().bg(bg))];
+        if dots.is_empty() {
+            let (dot, dot_style) = state_dot(crate::detect::AgentState::Unknown, true, p);
+            spans.push(Span::styled(dot, dot_style.bg(bg)));
+        } else {
+            for (state, seen) in &dots {
+                let (dot, dot_style) = state_dot(*state, *seen, p);
+                spans.push(Span::styled(dot, dot_style.bg(bg)));
+            }
+        }
+        spans.push(Span::styled(" ", Style::default().bg(bg)));
+        spans.push(Span::styled(name, name_style));
 
         if let Some(git) = &content.git {
             let dirty_w = git.dirty_width() as usize;
