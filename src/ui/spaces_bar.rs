@@ -1,11 +1,16 @@
 //! Horizontal spaces bar: workspaces rendered as chips on a single bottom row,
-//! replacing the vertical sidebar. Each chip shows the workspace state dot,
-//! name, git branch, a dirty marker (`*`, uncommitted changes), and
-//! ahead/behind counters. When space is tight the branch truncates first;
-//! the name, dirty marker, and counters survive longest.
+//! replacing the vertical sidebar. Each chip shows one clickable status dot
+//! per running agent (tab order), the workspace name, git branch, a dirty
+//! marker (`*`, uncommitted changes), and ahead/behind counters. When space is
+//! tight the branch truncates first; the name, dirty marker, and counters
+//! survive longest.
+//!
+//! Chip content is centered, so rendering and mouse hit-testing share
+//! `build_chip_line` to agree on where every span (notably the agent dots)
+//! actually lands.
 
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -21,12 +26,12 @@ use crate::terminal::TerminalRuntimeRegistry;
 /// Width reserved for the trailing new-space button (" + ").
 const NEW_SPACE_WIDTH: u16 = 3;
 
-/// Chip chrome besides the agent dots: leading pad, gap after the dots,
-/// trailing pad. Each agent dot adds one more cell.
-const CHIP_BASE_CHROME_WIDTH: u16 = 3;
-
 /// Branch names longer than this are elided with `…` in the chip.
 const MAX_BRANCH_WIDTH: usize = 11;
+
+/// Chip chrome besides the agent dots: leading pad, gap after the dots,
+/// trailing pad.
+const CHIP_BASE_CHROME_WIDTH: u16 = 3;
 
 struct ChipGit {
     branch: String,
@@ -60,21 +65,16 @@ impl ChipGit {
     }
 }
 
-struct ChipContent {
-    name: String,
-    git: Option<ChipGit>,
-}
-
-/// One `(state, seen)` entry per detected agent in the workspace, in stable
-/// order (tab order, then pane creation number — the pane map is unordered).
-/// Empty when no agent is running anywhere in the workspace.
+/// One entry per detected agent in the workspace, in stable order: tab order,
+/// then pane creation number (the pane map itself is unordered). Empty when
+/// no agent is running anywhere in the workspace.
 fn agent_dots(
     ws: &crate::workspace::Workspace,
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
-) -> Vec<(crate::detect::AgentState, bool)> {
+) -> Vec<(crate::layout::PaneId, crate::detect::AgentState, bool)> {
     let mut dots = Vec::new();
     for tab in &ws.tabs {
         let mut panes: Vec<_> = tab.panes.iter().collect();
@@ -84,10 +84,10 @@ fn agent_dots(
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        for (_, pane) in panes {
+        for (pane_id, pane) in panes {
             if let Some(terminal) = terminals.get(&pane.attached_terminal_id) {
                 if terminal.detected_agent.is_some() {
-                    dots.push((terminal.state, pane.seen));
+                    dots.push((*pane_id, terminal.state, pane.seen));
                 }
             }
         }
@@ -95,25 +95,180 @@ fn agent_dots(
     dots
 }
 
-fn chip_contents(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) -> Vec<ChipContent> {
-    app.workspaces
-        .iter()
-        .map(|ws| ChipContent {
-            name: ws.display_name_from(&app.terminals, terminal_runtimes),
-            git: ws.branch().map(|branch| ChipGit {
-                branch: truncate_end(&branch, MAX_BRANCH_WIDTH),
-                dirty: ws.git_dirty().unwrap_or(false),
-                ahead: ws.git_ahead_behind().map_or(0, |(a, _)| a),
-                behind: ws.git_ahead_behind().map_or(0, |(_, b)| b),
-            }),
+/// A chip's fully-styled line plus the geometry needed for dot hit-testing.
+struct ChipLine {
+    spans: Vec<Span<'static>>,
+    width: u16,
+    /// Offset of each agent dot from the start of the line.
+    dot_offsets: Vec<(crate::layout::PaneId, u16)>,
+    bg: ratatui::style::Color,
+}
+
+fn build_chip_line(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    ws_idx: usize,
+    chip_width: u16,
+) -> Option<ChipLine> {
+    let ws = app.workspaces.get(ws_idx)?;
+    let p = &app.palette;
+    let is_navigating = matches!(app.mode, Mode::Navigate);
+    let selected = ws_idx == app.selected && is_navigating;
+    let is_active = Some(ws_idx) == app.active;
+
+    let bg = if selected {
+        p.surface0
+    } else if is_active {
+        p.surface_dim
+    } else {
+        p.panel_bg
+    };
+    let name_style = if selected || is_active {
+        Style::default()
+            .fg(p.text)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.subtext0).bg(bg)
+    };
+    let branch_style = Style::default()
+        .fg(if selected || is_active {
+            p.mauve
+        } else {
+            p.overlay0
         })
-        .collect()
+        .bg(bg);
+
+    // Dots render as "● ● ●": one cell per dot, one gap between dots.
+    let dots = agent_dots(ws, &app.terminals);
+    let dots_width = if dots.is_empty() {
+        1
+    } else {
+        (dots.len() * 2 - 1) as u16
+    };
+
+    let name_full = ws.display_name_from(&app.terminals, terminal_runtimes);
+    let git = ws.branch().map(|branch| ChipGit {
+        branch: truncate_end(&branch, MAX_BRANCH_WIDTH),
+        dirty: ws.git_dirty().unwrap_or(false),
+        ahead: ws.git_ahead_behind().map_or(0, |(a, _)| a),
+        behind: ws.git_ahead_behind().map_or(0, |(_, b)| b),
+    });
+
+    // Fit content into the chip: the name wins, then the dirty marker, then
+    // the ahead/behind counters; the branch shrinks or drops first.
+    let content_budget = chip_width.saturating_sub(CHIP_BASE_CHROME_WIDTH + dots_width) as usize;
+    let name = truncate_end(&name_full, content_budget);
+    let mut budget = content_budget.saturating_sub(display_width_u16(&name) as usize);
+
+    let mut spans = vec![Span::styled(" ", Style::default().bg(bg))];
+    let mut dot_offsets = Vec::with_capacity(dots.len());
+    if dots.is_empty() {
+        let (dot, dot_style) = state_dot(crate::detect::AgentState::Unknown, true, p);
+        spans.push(Span::styled(dot, dot_style.bg(bg)));
+    } else {
+        for (i, (pane_id, state, seen)) in dots.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" ", Style::default().bg(bg)));
+            }
+            dot_offsets.push((*pane_id, 1 + 2 * i as u16));
+            let (dot, dot_style) = state_dot(*state, *seen, p);
+            spans.push(Span::styled(dot, dot_style.bg(bg)));
+        }
+    }
+    spans.push(Span::styled(" ", Style::default().bg(bg)));
+    spans.push(Span::styled(name, name_style));
+
+    if let Some(git) = &git {
+        let dirty_w = git.dirty_width() as usize;
+        let show_dirty = dirty_w > 0 && budget >= dirty_w;
+        if show_dirty {
+            budget -= dirty_w;
+        }
+        let arrows_w = git.arrows_width() as usize;
+        let show_arrows = arrows_w > 0 && budget >= arrows_w;
+        if show_arrows {
+            budget -= arrows_w;
+        }
+        // Leading gap + at least two branch cells, otherwise drop it.
+        let branch_avail = budget.saturating_sub(1);
+        if branch_avail >= 2 {
+            spans.push(Span::styled(" ", Style::default().bg(bg)));
+            spans.push(Span::styled(
+                truncate_end(&git.branch, branch_avail),
+                branch_style,
+            ));
+        }
+        if show_dirty {
+            spans.push(Span::styled(
+                "*",
+                Style::default()
+                    .fg(p.yellow)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if show_arrows {
+            let (ahead, behind) = git.arrows();
+            spans.push(Span::styled(" ", Style::default().bg(bg)));
+            if let Some(ahead) = ahead {
+                spans.push(Span::styled(ahead, Style::default().fg(p.green).bg(bg)));
+            }
+            if git.ahead > 0 && git.behind > 0 {
+                spans.push(Span::styled(" ", Style::default().bg(bg)));
+            }
+            if let Some(behind) = behind {
+                spans.push(Span::styled(behind, Style::default().fg(p.red).bg(bg)));
+            }
+        }
+    }
+    spans.push(Span::styled(" ", Style::default().bg(bg)));
+
+    let width = spans
+        .iter()
+        .map(|span| display_width_u16(&span.content))
+        .fold(0u16, |acc, w| acc.saturating_add(w));
+
+    Some(ChipLine {
+        spans,
+        width,
+        dot_offsets,
+        bg,
+    })
+}
+
+/// Where a centered chip line starts inside its card (mirrors the render).
+fn chip_line_start_x(card: &WorkspaceCardArea, line_width: u16) -> u16 {
+    card.rect.x + card.rect.width.saturating_sub(line_width) / 2
+}
+
+/// The agent pane whose status dot sits at (`col`, `row`), if any.
+pub(crate) fn spaces_bar_agent_dot_at(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    col: u16,
+    row: u16,
+) -> Option<(usize, crate::layout::PaneId)> {
+    let bar = app.view.spaces_bar_rect;
+    if bar.height == 0 || row != bar.y {
+        return None;
+    }
+    let card = app
+        .view
+        .workspace_card_areas
+        .iter()
+        .find(|card| col >= card.rect.x && col < card.rect.x + card.rect.width)?;
+    let line = build_chip_line(app, terminal_runtimes, card.ws_idx, card.rect.width)?;
+    let start_x = chip_line_start_x(card, line.width);
+    line.dot_offsets.iter().find_map(|(pane_id, offset)| {
+        (start_x.saturating_add(*offset) == col).then_some((card.ws_idx, *pane_id))
+    })
 }
 
 /// Lay the workspaces out left-to-right in `area`, splitting the row into
 /// equal shares: one chip takes the full width, two chips take half each, and
-/// so on. The new-space button and the menu launcher keep the right edge.
-/// Returns the per-workspace hit rects plus the new-space button rect.
+/// so on. The new-space button keeps the right edge. Returns the
+/// per-workspace hit rects plus the new-space button rect.
 pub(crate) fn compute_spaces_bar_areas(app: &AppState, area: Rect) -> (Vec<WorkspaceCardArea>, Rect) {
     if area.width == 0 || area.height == 0 || app.workspaces.is_empty() {
         return (Vec::new(), Rect::default());
@@ -168,128 +323,36 @@ pub(super) fn render_spaces_bar(
         return;
     }
     let p = &app.palette;
-    let is_navigating = matches!(app.mode, Mode::Navigate);
 
     frame.render_widget(
         Paragraph::new(" ".repeat(area.width as usize)).style(Style::default().bg(p.panel_bg)),
         area,
     );
 
-    let contents = chip_contents(app, terminal_runtimes);
     for card in &app.view.workspace_card_areas {
         if card.rect.width == 0 {
             continue;
         }
-        let i = card.ws_idx;
-        let (Some(ws), Some(content)) = (app.workspaces.get(i), contents.get(i)) else {
+        let Some(line) = build_chip_line(app, terminal_runtimes, card.ws_idx, card.rect.width)
+        else {
             continue;
         };
-        let selected = i == app.selected && is_navigating;
-        let is_active = Some(i) == app.active;
 
-        let bg = if selected {
-            p.surface0
-        } else if is_active {
-            p.surface_dim
-        } else {
-            p.panel_bg
-        };
-        let name_style = if selected || is_active {
-            Style::default()
-                .fg(p.text)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(p.subtext0).bg(bg)
-        };
-        let branch_style = Style::default()
-            .fg(if selected || is_active {
-                p.mauve
-            } else {
-                p.overlay0
-            })
-            .bg(bg);
-
-        // One dot per running agent; a neutral dot when there are none.
-        let dots = agent_dots(ws, &app.terminals);
-        let dots_width = dots.len().max(1) as u16;
-
-        // Fit content into the chip: the name wins, then the dirty marker,
-        // then the ahead/behind counters; the branch shrinks or drops first.
-        let content_budget = card
-            .rect
-            .width
-            .saturating_sub(CHIP_BASE_CHROME_WIDTH + dots_width) as usize;
-        let name = truncate_end(&content.name, content_budget);
-        let mut budget =
-            content_budget.saturating_sub(display_width_u16(&name) as usize);
-
-        let mut spans = vec![Span::styled(" ", Style::default().bg(bg))];
-        if dots.is_empty() {
-            let (dot, dot_style) = state_dot(crate::detect::AgentState::Unknown, true, p);
-            spans.push(Span::styled(dot, dot_style.bg(bg)));
-        } else {
-            for (state, seen) in &dots {
-                let (dot, dot_style) = state_dot(*state, *seen, p);
-                spans.push(Span::styled(dot, dot_style.bg(bg)));
-            }
-        }
-        spans.push(Span::styled(" ", Style::default().bg(bg)));
-        spans.push(Span::styled(name, name_style));
-
-        if let Some(git) = &content.git {
-            let dirty_w = git.dirty_width() as usize;
-            let show_dirty = dirty_w > 0 && budget >= dirty_w;
-            if show_dirty {
-                budget -= dirty_w;
-            }
-            let arrows_w = git.arrows_width() as usize;
-            let show_arrows = arrows_w > 0 && budget >= arrows_w;
-            if show_arrows {
-                budget -= arrows_w;
-            }
-            // Leading gap + at least two branch cells, otherwise drop it.
-            let branch_avail = budget.saturating_sub(1);
-            if branch_avail >= 2 {
-                spans.push(Span::styled(" ", Style::default().bg(bg)));
-                spans.push(Span::styled(
-                    truncate_end(&git.branch, branch_avail),
-                    branch_style,
-                ));
-            }
-            if show_dirty {
-                spans.push(Span::styled(
-                    "*",
-                    Style::default()
-                        .fg(p.yellow)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            if show_arrows {
-                let (ahead, behind) = git.arrows();
-                spans.push(Span::styled(" ", Style::default().bg(bg)));
-                if let Some(ahead) = ahead {
-                    spans.push(Span::styled(ahead, Style::default().fg(p.green).bg(bg)));
-                }
-                if git.ahead > 0 && git.behind > 0 {
-                    spans.push(Span::styled(" ", Style::default().bg(bg)));
-                }
-                if let Some(behind) = behind {
-                    spans.push(Span::styled(behind, Style::default().fg(p.red).bg(bg)));
-                }
-            }
-        }
-
-        spans.push(Span::styled(" ", Style::default().bg(bg)));
-        // Paragraph-level style paints the chip background across the full
-        // rect (spans only cover the text); centered so wide chips read well.
+        // Paint the chip background across the full rect, then render the
+        // line manually centered so dot hit-testing knows exact positions.
         frame.render_widget(
-            Paragraph::new(Line::from(spans))
-                .alignment(Alignment::Center)
-                .style(Style::default().bg(bg)),
+            Paragraph::new("").style(Style::default().bg(line.bg)),
             card.rect,
         );
+        let start_x = chip_line_start_x(card, line.width);
+        let card_right = card.rect.x + card.rect.width;
+        let line_rect = Rect::new(
+            start_x,
+            card.rect.y,
+            line.width.min(card_right.saturating_sub(start_x)),
+            1,
+        );
+        frame.render_widget(Paragraph::new(Line::from(line.spans)), line_rect);
     }
 
     if app.mouse_capture && app.view.new_space_hit_area.width > 0 {
@@ -313,5 +376,4 @@ pub(super) fn render_spaces_bar(
                 .set_style(Style::default().fg(p.accent));
         }
     }
-
 }

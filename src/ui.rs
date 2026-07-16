@@ -59,6 +59,7 @@ pub(crate) use self::scrollbar::{
 };
 use self::settings::render_settings_overlay;
 use self::spaces_bar::{compute_spaces_bar_areas, render_spaces_bar};
+pub(crate) use self::spaces_bar::spaces_bar_agent_dot_at;
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,

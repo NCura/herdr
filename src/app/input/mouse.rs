@@ -524,6 +524,15 @@ impl AppState {
                         self.request_new_workspace = true;
                         return None;
                     }
+                    if let Some((ws_idx, pane_id)) = crate::ui::spaces_bar_agent_dot_at(
+                        self,
+                        terminal_runtimes,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        self.mode = Mode::Terminal;
+                        return Some(MouseAction::FocusPane { ws_idx, pane_id });
+                    }
                     if let Some(card) = self.view.workspace_card_areas.iter().find(|card| {
                         mouse.column >= card.rect.x
                             && mouse.column < card.rect.x + card.rect.width
