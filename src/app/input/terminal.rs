@@ -52,6 +52,10 @@ impl App {
         self.state.update_dismissed = true;
 
         let key_event = key.as_key_event();
+        // Direct keybindings fire on the initial press only. Auto-repeat from a
+        // held key must not re-trigger the action (e.g. workspace focus cycling
+        // through agent panes), but it must not leak into the pane either.
+        let is_repeat = key_event.kind == crossterm::event::KeyEventKind::Repeat;
 
         if let Some(action) = super::terminal_direct_non_indexed_navigation_action(&self.state, key)
         {
@@ -62,6 +66,9 @@ impl App {
                 action = ?action,
                 "intercepted terminal direct keybinding before forwarding to pane"
             );
+            if is_repeat {
+                return None;
+            }
             if action == super::navigate::NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
             } else {
@@ -82,6 +89,9 @@ impl App {
                 command = %binding.label,
                 "intercepted terminal direct custom command before forwarding to pane"
             );
+            if is_repeat {
+                return None;
+            }
             self.launch_custom_command(binding, super::navigate::ActionContext::Direct);
             return None;
         }
@@ -94,6 +104,9 @@ impl App {
                 action = ?action,
                 "intercepted terminal direct indexed keybinding before forwarding to pane"
             );
+            if is_repeat {
+                return None;
+            }
             self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
             return None;
         }
@@ -1101,6 +1114,46 @@ mod tests {
             .await;
 
         assert_ne!(app.state.workspaces[0].layout.focused(), focused_before);
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn terminal_direct_keybinding_ignores_key_auto_repeat() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.view.pane_infos = app.state.workspaces[0]
+            .active_tab()
+            .unwrap()
+            .layout
+            .panes(Rect::new(0, 0, 80, 24));
+        app.state.keybinds.focus_pane_left = crate::config::ActionKeybinds::direct("alt+h");
+
+        app.handle_terminal_key(TerminalKey::new(KeyCode::Char('h'), KeyModifiers::ALT))
+            .await;
+        let focused_after_press = app.state.workspaces[0].layout.focused();
+
+        // A held key produces auto-repeat events; they must neither re-trigger
+        // the bound action nor reach the pane.
+        app.handle_terminal_key(
+            TerminalKey::new(KeyCode::Char('h'), KeyModifiers::ALT).with_kind(KeyEventKind::Repeat),
+        )
+        .await;
+
+        assert_eq!(
+            app.state.workspaces[0].layout.focused(),
+            focused_after_press
+        );
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
