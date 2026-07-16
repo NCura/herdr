@@ -508,6 +508,36 @@ impl AppState {
                     return None;
                 }
 
+                let spaces_bar = self.view.spaces_bar_rect;
+                let in_spaces_bar = spaces_bar.width > 0
+                    && mouse.column >= spaces_bar.x
+                    && mouse.column < spaces_bar.x + spaces_bar.width
+                    && mouse.row >= spaces_bar.y
+                    && mouse.row < spaces_bar.y + spaces_bar.height;
+                if in_spaces_bar {
+                    let plus = self.view.new_space_hit_area;
+                    if plus.width > 0
+                        && mouse.column >= plus.x
+                        && mouse.column < plus.x + plus.width
+                        && mouse.row == plus.y
+                    {
+                        self.request_new_workspace = true;
+                        return None;
+                    }
+                    if let Some(card) = self.view.workspace_card_areas.iter().find(|card| {
+                        mouse.column >= card.rect.x
+                            && mouse.column < card.rect.x + card.rect.width
+                            && mouse.row >= card.rect.y
+                            && mouse.row < card.rect.y + card.rect.height
+                    }) {
+                        self.mode = Mode::Terminal;
+                        return Some(MouseAction::FocusWorkspace {
+                            ws_idx: card.ws_idx,
+                        });
+                    }
+                    return None;
+                }
+
                 if in_sidebar {
                     if self.on_sidebar_toggle(mouse.column, mouse.row) {
                         self.sidebar_collapsed = !self.sidebar_collapsed;

@@ -565,6 +565,8 @@ impl App {
             view: state::ViewState {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                spaces_bar_rect: Rect::default(),
+                new_space_hit_area: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),

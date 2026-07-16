@@ -15,7 +15,12 @@ mod panes;
 mod release_notes;
 mod scrollbar;
 mod settings;
+// Vertical sidebar is replaced by the horizontal spaces bar; keep the module
+// compiled (mouse code and tests still reference parts of it) but allow the
+// now-unreachable renderers.
+#[allow(dead_code)]
 mod sidebar;
+mod spaces_bar;
 mod status;
 mod tabs;
 mod text;
@@ -53,7 +58,7 @@ pub(crate) use self::scrollbar::{
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
 use self::settings::render_settings_overlay;
-use self::sidebar::{render_sidebar, render_sidebar_collapsed};
+use self::spaces_bar::{compute_spaces_bar_areas, render_spaces_bar};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
@@ -96,6 +101,7 @@ use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
+#[allow(dead_code)]
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
 // Braille spinner frames — smooth rotation
@@ -217,18 +223,11 @@ fn compute_view_internal(
         return;
     }
 
-    let sidebar_w = if app.sidebar_collapsed {
-        match app.sidebar_collapsed_mode {
-            crate::config::SidebarCollapsedModeConfig::Compact => COLLAPSED_WIDTH,
-            crate::config::SidebarCollapsedModeConfig::Hidden => 0,
-        }
-    } else {
-        app.sidebar_width
-            .clamp(app.sidebar_min_width, app.sidebar_max_width)
-    };
-
-    let [sidebar_area, main_area] =
-        Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
+    // Spaces live in a single horizontal row at the top instead of a vertical
+    // sidebar; the agents panel is hidden for now. The old sidebar code paths
+    // stay compiled but inert (sidebar_rect is zero, so `in_sidebar` never hits).
+    let [spaces_bar_area, main_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
 
     let (tab_bar_rect, terminal_area) = app
         .active
@@ -236,23 +235,13 @@ fn compute_view_internal(
         .map(|ws| desktop_tab_bar_and_terminal_area(app, ws, main_area))
         .unwrap_or((Rect::default(), main_area));
 
-    if !app.sidebar_collapsed {
-        app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
-        let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
-        let max_agent_scroll = agent_panel_scroll_metrics(app, detail_area).max_offset_from_bottom;
-        app.agent_panel_scroll = app.agent_panel_scroll.min(max_agent_scroll);
-    } else {
-        app.workspace_scroll = app
-            .workspace_scroll
-            .min(app.workspaces.len().saturating_sub(1));
-        app.agent_panel_scroll = 0;
-    }
+    app.workspace_scroll = app
+        .workspace_scroll
+        .min(app.workspaces.len().saturating_sub(1));
+    app.agent_panel_scroll = 0;
 
-    let workspace_card_areas = if app.sidebar_collapsed {
-        Vec::new()
-    } else {
-        compute_workspace_card_areas(app, sidebar_area)
-    };
+    let (workspace_card_areas, new_space_hit_area) =
+        compute_spaces_bar_areas(app, terminal_runtimes, spaces_bar_area);
 
     let tab_bar_view = app
         .active
@@ -308,7 +297,9 @@ fn compute_view_internal(
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
-        sidebar_rect: sidebar_area,
+        sidebar_rect: Rect::default(),
+        spaces_bar_rect: spaces_bar_area,
+        new_space_hit_area,
         workspace_card_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
@@ -381,6 +372,8 @@ fn compute_mobile_view(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
+        spaces_bar_rect: Rect::default(),
+        new_space_hit_area: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
@@ -409,18 +402,13 @@ pub fn render_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
 ) {
-    let sidebar_area = app.view.sidebar_rect;
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
     if app.view.layout == ViewLayout::Mobile {
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
-    } else if sidebar_area.width > 0 {
-        if app.sidebar_collapsed {
-            render_sidebar_collapsed(app, frame, sidebar_area);
-        } else {
-            render_sidebar(app, terminal_runtimes, frame, sidebar_area);
-        }
+    } else if app.view.spaces_bar_rect.width > 0 {
+        render_spaces_bar(app, terminal_runtimes, frame, app.view.spaces_bar_rect);
     }
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
