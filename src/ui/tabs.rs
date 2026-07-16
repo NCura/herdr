@@ -24,15 +24,76 @@ pub(crate) struct TabBarView {
 
 #[allow(dead_code)] // natural width, kept for the pre-full-width layout tests
 fn tab_width(ws: &crate::workspace::Workspace, tab_idx: usize) -> u16 {
-    display_width_u16(&tab_chrome_label(ws, tab_idx))
-        .saturating_add(4)
-        .max(MIN_TAB_WIDTH)
+    display_width_u16(&tab_chrome_label(
+        ws,
+        tab_idx,
+        &std::collections::HashMap::new(),
+    ))
+    .saturating_add(4)
+    .max(MIN_TAB_WIDTH)
 }
 
-fn tab_chrome_label(ws: &crate::workspace::Workspace, tab_idx: usize) -> String {
-    let name = ws
-        .tab_display_name(tab_idx)
-        .unwrap_or_else(|| (tab_idx + 1).to_string());
+/// Cap on the activity suffix so a noisy terminal title can't flood the tab.
+const MAX_TAB_ACTIVITY_WIDTH: usize = 20;
+
+/// What the tab is currently doing: the detected agent of the focused pane
+/// (then of any pane in the tab), falling back to the focused pane's stripped
+/// terminal title (how full-screen apps announce themselves).
+fn tab_activity_label(
+    ws: &crate::workspace::Workspace,
+    tab_idx: usize,
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+) -> Option<String> {
+    let tab = ws.tabs.get(tab_idx)?;
+    let agent_activity = |pane_id: crate::layout::PaneId| -> Option<String> {
+        let pane = tab.panes.get(&pane_id)?;
+        let terminal = terminals.get(&pane.attached_terminal_id)?;
+        terminal
+            .effective_display_agent()
+            .or_else(|| terminal.agent_name.clone())
+            .or_else(|| terminal.effective_agent_label().map(str::to_string))
+    };
+
+    let focused = tab.layout.focused();
+    if let Some(activity) = agent_activity(focused) {
+        return Some(activity);
+    }
+    for pane_id in tab.layout.pane_ids() {
+        if let Some(activity) = agent_activity(pane_id) {
+            return Some(activity);
+        }
+    }
+
+    let pane = tab.panes.get(&focused)?;
+    terminals
+        .get(&pane.attached_terminal_id)?
+        .terminal_title_stripped()
+}
+
+/// Tabs are named by position; the current activity (agent or terminal
+/// title) rides along as a suffix, and a manual rename replaces the suffix.
+fn tab_chrome_label(
+    ws: &crate::workspace::Workspace,
+    tab_idx: usize,
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+) -> String {
+    let number = tab_idx + 1;
+    let suffix = ws
+        .tabs
+        .get(tab_idx)
+        .and_then(|tab| tab.custom_name.clone())
+        .or_else(|| tab_activity_label(ws, tab_idx, terminals))
+        .map(|activity| truncate_end(&activity, MAX_TAB_ACTIVITY_WIDTH));
+    let name = match suffix {
+        Some(activity) => format!("{number} {activity}"),
+        None => number.to_string(),
+    };
     if ws.tabs.get(tab_idx).is_some_and(|tab| tab.zoomed) {
         format!("{name} Z")
     } else {
@@ -340,7 +401,7 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         } else {
             Style::default().fg(p.overlay1).bg(p.surface0)
         };
-        let name = tab_chrome_label(ws, idx);
+        let name = tab_chrome_label(ws, idx, &app.terminals);
         let name = truncate_end(&name, (rect.width as usize).saturating_sub(2));
         frame.render_widget(
             Paragraph::new(name).alignment(Alignment::Center).style(style),
