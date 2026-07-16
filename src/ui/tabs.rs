@@ -22,6 +22,7 @@ pub(crate) struct TabBarView {
     pub new_tab_hit_area: Rect,
 }
 
+#[allow(dead_code)] // natural width, kept for the pre-full-width layout tests
 fn tab_width(ws: &crate::workspace::Workspace, tab_idx: usize) -> u16 {
     display_width_u16(&tab_chrome_label(ws, tab_idx))
         .saturating_add(4)
@@ -39,21 +40,24 @@ fn tab_chrome_label(ws: &crate::workspace::Workspace, tab_idx: usize) -> String 
     }
 }
 
-fn layout_tab_hit_areas(ws: &crate::workspace::Workspace, area: Rect, scroll: usize) -> Vec<Rect> {
+/// Tabs split the row into equal shares (with a 1-cell gap between chips so
+/// same-styled neighbors stay distinguishable): one tab takes the full width,
+/// two take half each, and so on. `scroll` is ignored — every tab always fits
+/// (widths only hit zero when there are more tabs than columns).
+fn layout_tab_hit_areas(ws: &crate::workspace::Workspace, area: Rect, _scroll: usize) -> Vec<Rect> {
     let mut rects = vec![Rect::default(); ws.tabs.len()];
-    if area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 || ws.tabs.is_empty() {
         return rects;
     }
 
+    let count = ws.tabs.len() as u16;
+    let gaps = count.saturating_sub(1);
+    let avail = area.width.saturating_sub(gaps);
+    let base = avail / count;
+    let extra = avail % count;
     let mut x = area.x;
-    let right = area.x + area.width;
-    for (idx, rect) in rects.iter_mut().enumerate().skip(scroll) {
-        if x >= right {
-            break;
-        }
-        let desired = tab_width(ws, idx);
-        let remaining = right.saturating_sub(x);
-        let width = desired.min(remaining).max(1);
+    for (idx, rect) in rects.iter_mut().enumerate() {
+        let width = base + u16::from((idx as u16) < extra);
         *rect = Rect::new(x, area.y, width, 1);
         x = x.saturating_add(width + 1);
     }

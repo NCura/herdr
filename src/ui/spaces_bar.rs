@@ -18,8 +18,6 @@ use crate::app::state::WorkspaceCardArea;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
-/// Minimum chip width when space is tight: dot + at least a couple of name cells.
-const MIN_CHIP_WIDTH: u16 = 8;
 /// Width reserved for the trailing new-space button (" + ").
 const NEW_SPACE_WIDTH: u16 = 3;
 
@@ -27,7 +25,7 @@ const NEW_SPACE_WIDTH: u16 = 3;
 const CHIP_CHROME_WIDTH: u16 = 4;
 
 /// Branch names longer than this are elided with `…` in the chip.
-const MAX_BRANCH_WIDTH: usize = 10;
+const MAX_BRANCH_WIDTH: usize = 11;
 
 struct ChipGit {
     branch: String,
@@ -66,17 +64,6 @@ struct ChipContent {
     git: Option<ChipGit>,
 }
 
-impl ChipContent {
-    fn natural_width(&self) -> u16 {
-        let git_w = self.git.as_ref().map_or(0, |git| {
-            1 + display_width_u16(&git.branch) + git.dirty_width() + git.arrows_width()
-        });
-        display_width_u16(&self.name)
-            .saturating_add(CHIP_CHROME_WIDTH)
-            .saturating_add(git_w)
-    }
-}
-
 fn chip_contents(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) -> Vec<ChipContent> {
     app.workspaces
         .iter()
@@ -92,20 +79,16 @@ fn chip_contents(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) ->
         .collect()
 }
 
-/// Lay the workspaces out left-to-right in `area`. When the natural widths
-/// overflow, every chip is capped to an equal share (never below
-/// `MIN_CHIP_WIDTH`); chips that still don't fit are clipped at the right edge.
+/// Lay the workspaces out left-to-right in `area`, splitting the row into
+/// equal shares: one chip takes the full width, two chips take half each, and
+/// so on. The new-space button and the menu launcher keep the right edge.
 /// Returns the per-workspace hit rects plus the new-space button rect.
-pub(crate) fn compute_spaces_bar_areas(
-    app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    area: Rect,
-) -> (Vec<WorkspaceCardArea>, Rect) {
+pub(crate) fn compute_spaces_bar_areas(app: &AppState, area: Rect) -> (Vec<WorkspaceCardArea>, Rect) {
     if area.width == 0 || area.height == 0 || app.workspaces.is_empty() {
         return (Vec::new(), Rect::default());
     }
 
-    let contents = chip_contents(app, terminal_runtimes);
+    let count = app.workspaces.len() as u16;
     let new_space_reserved = if app.mouse_capture { NEW_SPACE_WIDTH } else { 0 };
     // The global menu launcher sits at the far right of the bar.
     let menu_reserved = if app.global_menu_attention_badge_visible() {
@@ -118,23 +101,15 @@ pub(crate) fn compute_spaces_bar_areas(
         .saturating_sub(new_space_reserved)
         .saturating_sub(menu_reserved);
 
-    let naturals: Vec<u16> = contents.iter().map(ChipContent::natural_width).collect();
-    let total: u16 = naturals
-        .iter()
-        .fold(0u16, |acc, w| acc.saturating_add(*w));
-    let cap = if total <= avail {
-        u16::MAX
-    } else {
-        (avail / contents.len().max(1) as u16).max(MIN_CHIP_WIDTH)
-    };
+    let base = avail / count;
+    let extra = avail % count;
 
-    let mut cards = Vec::with_capacity(contents.len());
+    let mut cards = Vec::with_capacity(count as usize);
     let mut x = area.x;
-    let right = area.x + avail;
-    for (ws_idx, natural) in naturals.iter().enumerate() {
-        let width = (*natural).min(cap).min(right.saturating_sub(x));
+    for ws_idx in 0..count {
+        let width = base + u16::from(ws_idx < extra);
         cards.push(WorkspaceCardArea {
-            ws_idx,
+            ws_idx: ws_idx as usize,
             rect: Rect::new(x, area.y, width, 1),
             indented: false,
         });
