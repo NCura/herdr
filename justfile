@@ -43,11 +43,11 @@ install-hooks:
 build:
     cargo build --release --locked
 
-# Fast UI iteration: rebuild and relaunch in the isolated `nc` session
-# (same config/session as the nix-installed nc-herdr wrapper, no nix rebuild)
+# Fast UI iteration: rebuild and relaunch in the isolated `fleet` session
+# (same config/session as the nix-installed fleet wrapper, no nix rebuild)
 dev: build
-    target/release/herdr --session nc server stop 2>/dev/null || true
-    HERDR_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/nc-herdr/config.toml" target/release/herdr --session nc
+    target/release/herdr --session fleet server stop 2>/dev/null || true
+    HERDR_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/fleet/config.toml" target/release/herdr --session fleet
 
 # Build the website and documentation
 website-build:
