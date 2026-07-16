@@ -19,6 +19,7 @@ use ratatui::{
 
 use super::status::state_dot;
 use super::text::{display_width_u16, truncate_end};
+use super::widgets::panel_contrast_fg;
 use crate::app::state::WorkspaceCardArea;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
@@ -119,18 +120,20 @@ fn build_chip_line(
     let selected = ws_idx == app.selected && is_navigating;
     let is_active = Some(ws_idx) == app.active;
 
-    let bg = if selected {
+    // The active space gets the exact same treatment as the active tab:
+    // accent background, contrast foreground. Colored glyphs (dirty star,
+    // arrows) switch to the contrast fg there — they'd drown on accent.
+    let contrast = panel_contrast_fg(p);
+    let bg = if is_active {
+        p.accent
+    } else if selected {
         p.surface0
-    } else if is_active {
-        p.surface_dim
     } else {
         p.panel_bg
     };
-    // The active space's name takes the accent color so both bars answer
-    // "where am I" with the same visual cue as the active tab.
     let name_style = if is_active {
         Style::default()
-            .fg(p.accent)
+            .fg(contrast)
             .bg(bg)
             .add_modifier(Modifier::BOLD)
     } else if selected {
@@ -141,13 +144,33 @@ fn build_chip_line(
     } else {
         Style::default().fg(p.subtext0).bg(bg)
     };
-    let prefix_style = Style::default().fg(p.overlay0).bg(bg);
-    let branch_style = Style::default()
-        .fg(if selected || is_active {
-            p.mauve
-        } else {
-            p.overlay0
-        })
+    let prefix_style = if is_active {
+        Style::default()
+            .fg(contrast)
+            .bg(bg)
+            .add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(p.overlay0).bg(bg)
+    };
+    let branch_style = if is_active {
+        Style::default()
+            .fg(contrast)
+            .bg(bg)
+            .add_modifier(Modifier::DIM)
+    } else if selected {
+        Style::default().fg(p.mauve).bg(bg)
+    } else {
+        Style::default().fg(p.overlay0).bg(bg)
+    };
+    let dirty_style = Style::default()
+        .fg(if is_active { contrast } else { p.yellow })
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let ahead_style = Style::default()
+        .fg(if is_active { contrast } else { p.green })
+        .bg(bg);
+    let behind_style = Style::default()
+        .fg(if is_active { contrast } else { p.red })
         .bg(bg);
 
     // Dots render as "● ● ●" at the end of the chip: one cell per dot, one
@@ -206,25 +229,19 @@ fn build_chip_line(
             ));
         }
         if show_dirty {
-            spans.push(Span::styled(
-                "*",
-                Style::default()
-                    .fg(p.yellow)
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled("*", dirty_style));
         }
         if show_arrows {
             let (ahead, behind) = git.arrows();
             spans.push(Span::styled(" ", Style::default().bg(bg)));
             if let Some(ahead) = ahead {
-                spans.push(Span::styled(ahead, Style::default().fg(p.green).bg(bg)));
+                spans.push(Span::styled(ahead, ahead_style));
             }
             if git.ahead > 0 && git.behind > 0 {
                 spans.push(Span::styled(" ", Style::default().bg(bg)));
             }
             if let Some(behind) = behind {
-                spans.push(Span::styled(behind, Style::default().fg(p.red).bg(bg)));
+                spans.push(Span::styled(behind, behind_style));
             }
         }
     }
