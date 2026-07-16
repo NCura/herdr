@@ -77,7 +77,13 @@ impl App {
         if self.state.workspaces.get(index).is_none() {
             return workspace_not_found(id, &target.workspace_id);
         }
-        self.state.switch_workspace(index);
+        // Focusing the already-active workspace cycles through its agent
+        // panes by attention priority instead of being a no-op.
+        if self.state.active == Some(index) && self.state.cycle_agent_pane_by_priority(index) {
+            self.state.settle_terminal_mode_after_focus();
+        } else {
+            self.state.switch_workspace(index);
+        }
 
         encode_success(
             id,

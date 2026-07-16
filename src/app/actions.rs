@@ -1031,6 +1031,57 @@ impl AppState {
         }
     }
 
+    /// Re-activating the already-active workspace jumps between its agent
+    /// panes by attention priority (blocked > done > working > idle); if one
+    /// of them is already focused, move on to the next, cycling. Returns
+    /// false when the workspace has no agent panes.
+    pub(crate) fn cycle_agent_pane_by_priority(&mut self, ws_idx: usize) -> bool {
+        let Some(ws) = self.workspaces.get(ws_idx) else {
+            return false;
+        };
+
+        // (priority, tab order, pane creation order) — highest priority
+        // first, ties broken by stable visual order.
+        let mut agents: Vec<(u8, usize, usize, crate::layout::PaneId)> = Vec::new();
+        for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+            for (pane_id, pane) in tab.panes.iter() {
+                let Some(terminal) = self.terminals.get(&pane.attached_terminal_id) else {
+                    continue;
+                };
+                if terminal.detected_agent.is_none() {
+                    continue;
+                }
+                let pane_number = ws
+                    .public_pane_numbers
+                    .get(pane_id)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                agents.push((
+                    crate::workspace::pane_attention_priority(terminal.state, pane.seen),
+                    tab_idx,
+                    pane_number,
+                    *pane_id,
+                ));
+            }
+        }
+        if agents.is_empty() {
+            return false;
+        }
+        agents.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+        let focused = ws.focused_pane_id();
+        let target = match agents
+            .iter()
+            .position(|(_, _, _, pane_id)| Some(*pane_id) == focused)
+        {
+            Some(current) => agents[(current + 1) % agents.len()].3,
+            None => agents[0].3,
+        };
+        self.focus_pane_in_workspace(ws_idx, target);
+        self.mark_active_tab_seen();
+        true
+    }
+
     pub(crate) fn switch_workspace_tab(&mut self, ws_idx: usize, tab_idx: usize) -> bool {
         if ws_idx >= self.workspaces.len() {
             return false;
