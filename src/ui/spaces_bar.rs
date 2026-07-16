@@ -26,6 +26,9 @@ const NEW_SPACE_WIDTH: u16 = 3;
 /// Chip chrome around the content: leading pad, state dot, gap, trailing pad.
 const CHIP_CHROME_WIDTH: u16 = 4;
 
+/// Branch names longer than this are elided with `…` in the chip.
+const MAX_BRANCH_WIDTH: usize = 10;
+
 struct ChipGit {
     branch: String,
     dirty: bool,
@@ -80,7 +83,7 @@ fn chip_contents(app: &AppState, terminal_runtimes: &TerminalRuntimeRegistry) ->
         .map(|ws| ChipContent {
             name: ws.display_name_from(&app.terminals, terminal_runtimes),
             git: ws.branch().map(|branch| ChipGit {
-                branch,
+                branch: truncate_end(&branch, MAX_BRANCH_WIDTH),
                 dirty: ws.git_dirty().unwrap_or(false),
                 ahead: ws.git_ahead_behind().map_or(0, |(a, _)| a),
                 behind: ws.git_ahead_behind().map_or(0, |(_, b)| b),
@@ -146,6 +149,16 @@ pub(crate) fn compute_spaces_bar_areas(
     };
 
     (cards, new_space_hit_area)
+}
+
+/// Column of the drop indicator for a workspace drag: the left edge of the
+/// chip at `insert_idx`, or the right edge of the last chip for an append.
+fn drop_indicator_x(cards: &[WorkspaceCardArea], insert_idx: usize) -> Option<u16> {
+    if let Some(card) = cards.iter().find(|card| card.ws_idx == insert_idx) {
+        return Some(card.rect.x);
+    }
+    let last = cards.last()?;
+    (insert_idx == last.ws_idx + 1).then(|| last.rect.x + last.rect.width)
 }
 
 pub(super) fn render_spaces_bar(
@@ -270,6 +283,21 @@ pub(super) fn render_spaces_bar(
             Paragraph::new(" + ").style(Style::default().fg(p.overlay1).bg(p.panel_bg)),
             app.view.new_space_hit_area,
         );
+    }
+
+    if let Some(crate::app::state::DragState {
+        target:
+            crate::app::state::DragTarget::WorkspaceReorder {
+                insert_idx: Some(insert_idx),
+                ..
+            },
+    }) = &app.drag
+    {
+        if let Some(x) = drop_indicator_x(&app.view.workspace_card_areas, *insert_idx) {
+            frame.buffer_mut()[(x.min(area.x + area.width.saturating_sub(1)), area.y)]
+                .set_symbol("│")
+                .set_style(Style::default().fg(p.accent));
+        }
     }
 
     let menu_rect = app.global_launcher_rect();

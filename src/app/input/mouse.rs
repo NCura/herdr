@@ -530,10 +530,14 @@ impl AppState {
                             && mouse.row >= card.rect.y
                             && mouse.row < card.rect.y + card.rect.height
                     }) {
-                        self.mode = Mode::Terminal;
-                        return Some(MouseAction::FocusWorkspace {
+                        // Focus happens on release (Up handler); recording the
+                        // press first lets a drag turn into a chip reorder.
+                        self.workspace_press = Some(WorkspacePressState {
                             ws_idx: card.ws_idx,
+                            start_col: mouse.column,
+                            start_row: mouse.row,
                         });
+                        return None;
                     }
                     return None;
                 }
@@ -719,7 +723,7 @@ impl AppState {
                     }
                 }
 
-                let workspace_drop_index = self.workspace_drop_index_at_row(mouse.row);
+                let workspace_drop_index = self.workspace_drop_index_at_col(mouse.column);
                 let tab_drop_index = self.tab_drop_index_at(mouse.column, mouse.row);
                 if self.drag.is_none() {
                     if let Some(press) = &self.workspace_press {

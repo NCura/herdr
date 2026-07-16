@@ -362,6 +362,45 @@ impl AppState {
         Some((detail.ws_idx, detail.tab_idx, detail.pane_id))
     }
 
+    /// Drop position for a workspace drag along the horizontal spaces bar:
+    /// the chip boundary nearest to `col`. Boundaries inside a worktree-space
+    /// group are skipped so groups stay contiguous, mirroring the row-based
+    /// sidebar logic.
+    pub(super) fn workspace_drop_index_at_col(&self, col: u16) -> Option<usize> {
+        let cards = &self.view.workspace_card_areas;
+        if self.view.spaces_bar_rect.width == 0 || cards.is_empty() {
+            return None;
+        }
+
+        let mut boundaries = Vec::with_capacity(cards.len() + 1);
+        for (idx, card) in cards.iter().enumerate() {
+            let card_group = self
+                .workspaces
+                .get(card.ws_idx)
+                .and_then(|ws| ws.worktree_space())
+                .map(|space| space.key.as_str());
+            let previous_group = idx.checked_sub(1).and_then(|prev_idx| {
+                self.workspaces
+                    .get(cards[prev_idx].ws_idx)
+                    .and_then(|ws| ws.worktree_space())
+                    .map(|space| space.key.as_str())
+            });
+            let inside_group_gap = card_group.is_some() && card_group == previous_group;
+            if !inside_group_gap {
+                boundaries.push((card.ws_idx, card.rect.x));
+            }
+        }
+        if let Some(last) = cards.last() {
+            boundaries.push((last.ws_idx + 1, last.rect.x + last.rect.width));
+        }
+
+        boundaries
+            .into_iter()
+            .min_by_key(|(insert_idx, x)| (col.abs_diff(*x), *insert_idx))
+            .map(|(insert_idx, _)| insert_idx)
+    }
+
+    #[allow(dead_code)] // row-based variant for the (currently disabled) vertical sidebar
     pub(super) fn workspace_drop_index_at_row(&self, row: u16) -> Option<usize> {
         let area = self.workspace_list_rect();
         let footer = self.sidebar_footer_rect();
