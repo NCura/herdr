@@ -1169,6 +1169,29 @@ fn run_client_with_mode(
         }
     };
 
+    // A daemonized server can hold stale or missing display variables (e.g. no
+    // WAYLAND_DISPLAY after a respawn over SSH), which breaks clipboard access
+    // for processes inside panes. Forward this client's display environment so
+    // panes spawned from now on resolve against the session the user is
+    // actually attached from. Remote bridge clients skip this: their local
+    // display is meaningless on the server host.
+    let forwarded_env = crate::platform::attach_forwarded_env();
+    #[cfg(unix)]
+    let forwarded_env = if is_remote_client_process() {
+        Vec::new()
+    } else {
+        forwarded_env
+    };
+    if !forwarded_env.is_empty() {
+        let update = ClientMessage::UpdateEnvironment {
+            vars: forwarded_env,
+        };
+        if let Err(err) = write_to_server(&mut stream, &update) {
+            eprintln!("herdr: failed to send environment update: {err}");
+            std::process::exit(1);
+        }
+    }
+
     if let Some((terminal_id, takeover)) = attach_request {
         let attach = ClientMessage::AttachTerminal {
             terminal_id,

@@ -90,6 +90,7 @@ mod render_prof;
 mod selection;
 mod server;
 mod session;
+mod session_env;
 mod sound;
 mod terminal;
 mod terminal_modes;

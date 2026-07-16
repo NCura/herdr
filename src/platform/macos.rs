@@ -580,6 +580,12 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// macOS clipboard and display access need no per-session environment
+/// variables, so attaching clients have nothing to forward.
+pub fn attach_forwarded_env() -> Vec<(String, Option<String>)> {
+    Vec::new()
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     let path = std::env::temp_dir().join(format!(
         "herdr-clipboard-image-{}-{}.png",

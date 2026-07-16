@@ -2822,6 +2822,21 @@ impl HeadlessServer {
                     }
                 }
             }
+            ServerEvent::ClientUpdateEnvironment { client_id, vars } => {
+                debug!(
+                    client_id,
+                    count = vars.len(),
+                    "client environment update received"
+                );
+                if matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(ClientConnectionMode::TerminalObserve { .. })
+                ) {
+                    return false;
+                }
+                crate::session_env::update_from_client(vars);
+                false
+            }
             ServerEvent::ClientResize {
                 client_id,
                 cols,

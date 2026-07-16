@@ -109,6 +109,8 @@ impl PaneLaunchEnv {
 }
 
 fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
+    // Session environment first so explicit per-pane extras can override it.
+    crate::session_env::apply_to_command(cmd);
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
     }

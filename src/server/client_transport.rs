@@ -41,6 +41,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 /// Maximum structured input events accepted in one client message.
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
+/// Maximum variables accepted in one `ClientMessage::UpdateEnvironment`.
+const MAX_ENVIRONMENT_VARS: usize = 64;
+/// Maximum name or value length accepted per forwarded environment variable.
+const MAX_ENVIRONMENT_VAR_LEN: usize = 4096;
 
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
@@ -306,6 +310,11 @@ pub(crate) enum ServerEvent {
         extension: String,
         data: Vec<u8>,
     },
+    /// A client forwarded its session environment for future pane spawns.
+    ClientUpdateEnvironment {
+        client_id: u64,
+        vars: Vec<(String, Option<String>)>,
+    },
     /// A client requested direct attach to one terminal.
     ClientAttachTerminal {
         client_id: u64,
@@ -388,6 +397,16 @@ fn input_events_within_limits(events: &[ClientInputEvent]) -> bool {
     }
 
     true
+}
+
+fn environment_vars_within_limits(vars: &[(String, Option<String>)]) -> bool {
+    vars.len() <= MAX_ENVIRONMENT_VARS
+        && vars.iter().all(|(name, value)| {
+            name.len() <= MAX_ENVIRONMENT_VAR_LEN
+                && value
+                    .as_ref()
+                    .is_none_or(|value| value.len() <= MAX_ENVIRONMENT_VAR_LEN)
+        })
 }
 
 #[cfg(windows)]
@@ -704,6 +723,19 @@ fn client_read_loop(
                     }
                 }
             }
+            ClientMessage::UpdateEnvironment { vars } => {
+                if !environment_vars_within_limits(&vars) {
+                    warn!(
+                        client_id,
+                        count = vars.len(),
+                        "oversized environment update from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ClientUpdateEnvironment { client_id, vars }
+            }
             ClientMessage::Resize {
                 cols,
                 rows,
@@ -986,6 +1018,32 @@ mod tests {
             clamp_terminal_size(MIN_CLIENT_COLS, MIN_CLIENT_ROWS),
             (MIN_CLIENT_COLS, MIN_CLIENT_ROWS)
         );
+    }
+
+    #[test]
+    fn environment_vars_within_limits_accepts_tracked_display_vars() {
+        assert!(environment_vars_within_limits(&[
+            ("WAYLAND_DISPLAY".to_owned(), Some("wayland-1".to_owned())),
+            ("DISPLAY".to_owned(), None),
+        ]));
+        assert!(environment_vars_within_limits(&[]));
+    }
+
+    #[test]
+    fn environment_vars_within_limits_rejects_oversized_updates() {
+        let too_many: Vec<(String, Option<String>)> = (0..=MAX_ENVIRONMENT_VARS)
+            .map(|i| (format!("VAR_{i}"), None))
+            .collect();
+        assert!(!environment_vars_within_limits(&too_many));
+
+        assert!(!environment_vars_within_limits(&[(
+            "N".repeat(MAX_ENVIRONMENT_VAR_LEN + 1),
+            None,
+        )]));
+        assert!(!environment_vars_within_limits(&[(
+            "DISPLAY".to_owned(),
+            Some("v".repeat(MAX_ENVIRONMENT_VAR_LEN + 1)),
+        )]));
     }
 
     #[test]

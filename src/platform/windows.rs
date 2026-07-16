@@ -532,6 +532,12 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
     None
 }
 
+/// Windows clipboard and display access need no per-session environment
+/// variables, so attaching clients have nothing to forward.
+pub fn attach_forwarded_env() -> Vec<(String, Option<String>)> {
+    Vec::new()
+}
+
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
 }

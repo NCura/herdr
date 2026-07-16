@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -394,6 +394,16 @@ pub enum ClientMessage {
         target: String,
         /// Replace an existing writable controller for this terminal.
         takeover: bool,
+    },
+
+    /// Session environment snapshot from an attaching client, applied to panes
+    /// spawned after this message. A daemonized server can hold stale or
+    /// missing display variables (e.g. `WAYLAND_DISPLAY` after a respawn over
+    /// SSH); the latest local client's snapshot wins.
+    UpdateEnvironment {
+        /// Tracked (name, value) pairs. A `None` value removes the variable
+        /// from future pane spawn environments.
+        vars: Vec<(String, Option<String>)>,
     },
 }
 
@@ -1043,6 +1053,24 @@ mod tests {
             }),
             9
         );
+        assert_eq!(
+            tag(&ClientMessage::UpdateEnvironment { vars: Vec::new() }),
+            10
+        );
+    }
+
+    #[test]
+    fn client_update_environment_roundtrip() {
+        let msg = ClientMessage::UpdateEnvironment {
+            vars: vec![
+                ("WAYLAND_DISPLAY".to_owned(), Some("wayland-1".to_owned())),
+                ("DISPLAY".to_owned(), None),
+            ],
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
     }
 
     #[test]

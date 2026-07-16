@@ -102,6 +102,11 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 }
 
 /// Unsupported platform stub.
+pub fn attach_forwarded_env() -> Vec<(String, Option<String>)> {
+    Vec::new()
+}
+
+/// Unsupported platform stub.
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
 }

@@ -365,6 +365,21 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Display-session variables a local client forwards to the server on attach.
+///
+/// Pane child processes (and the clipboard tools they run, like `wl-paste`)
+/// resolve these against the compositor the user is actually looking at, so
+/// the server refreshes its pane spawn environment from the most recently
+/// attached local client instead of trusting its own possibly stale copy.
+const ATTACH_FORWARDED_ENV_VARS: &[&str] = &["WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY"];
+
+pub fn attach_forwarded_env() -> Vec<(String, Option<String>)> {
+    ATTACH_FORWARDED_ENV_VARS
+        .iter()
+        .map(|name| ((*name).to_owned(), std::env::var(name).ok()))
+        .collect()
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     for (mime, extension) in [
         ("image/png", "png"),
@@ -795,6 +810,18 @@ mod tests {
             process_pgrp_and_comm_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
             Some((456, "name with ) paren".to_string()))
         );
+    }
+
+    #[test]
+    fn attach_forwarded_env_snapshots_present_and_absent_vars() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-1");
+            std::env::remove_var("DISPLAY");
+        }
+        let vars = attach_forwarded_env();
+        assert!(vars.contains(&("WAYLAND_DISPLAY".to_owned(), Some("wayland-1".to_owned()))));
+        assert!(vars.contains(&("DISPLAY".to_owned(), None)));
     }
 
     #[test]
