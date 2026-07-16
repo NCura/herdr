@@ -216,23 +216,12 @@ pub(crate) fn compute_tab_bar_view(
     }
 
     let area_right = area.x + area.width;
-    // One cell of breathing room between the last tab and the + button.
-    let all_tabs_area = Rect::new(
-        area.x,
-        area.y,
-        area.width.saturating_sub(NEW_TAB_WIDTH + 1),
-        area.height,
-    );
-    let all_tabs = layout_tab_hit_areas(ws, all_tabs_area, 0);
+    // The new-tab button floats at the top-right of the window, so tabs get
+    // the full row.
+    let all_tabs = layout_tab_hit_areas(ws, area, 0);
     let overflow = all_tabs.iter().any(|rect| rect.width == 0);
     if !overflow {
-        // Pinned to the right edge, like the spaces row's + button.
-        let new_tab_hit_area = Rect::new(
-            area_right.saturating_sub(NEW_TAB_WIDTH.min(area.width)),
-            area.y,
-            NEW_TAB_WIDTH.min(area.width),
-            1,
-        );
+        let new_tab_hit_area = Rect::default();
         return TabBarView {
             scroll: 0,
             tab_hit_areas: all_tabs,
@@ -460,13 +449,6 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
                     .set_style(Style::default().fg(p.accent));
             }
         }
-    }
-
-    if app.mouse_capture && app.view.new_tab_hit_area.width > 0 {
-        frame.render_widget(
-            Paragraph::new(" + ").style(Style::default().fg(p.overlay1)),
-            app.view.new_tab_hit_area,
-        );
     }
 
     if first_visible_idx.is_some_and(|idx| idx > 0) {

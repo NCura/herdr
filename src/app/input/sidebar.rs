@@ -200,6 +200,29 @@ impl AppState {
         Rect::new(x, screen.y, width, 1)
     }
 
+    /// " +space " button, floating left of the menu launcher.
+    pub(crate) fn new_space_button_rect(&self) -> Rect {
+        if self.view.layout == ViewLayout::Mobile {
+            return Rect::default();
+        }
+        let menu = self.global_launcher_rect();
+        if menu.width == 0 {
+            return Rect::default();
+        }
+        let width = 8u16.min(menu.x);
+        Rect::new(menu.x.saturating_sub(width), menu.y, width, 1)
+    }
+
+    /// " +tab " button, floating left of the new-space button.
+    pub(crate) fn new_tab_button_rect(&self) -> Rect {
+        let space = self.new_space_button_rect();
+        if space.width == 0 {
+            return Rect::default();
+        }
+        let width = 6u16.min(space.x);
+        Rect::new(space.x.saturating_sub(width), space.y, width, 1)
+    }
+
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
         let mut labels = vec!["settings", "keybinds", "reload config"];
         if self.update_available.is_some() {

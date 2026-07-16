@@ -24,9 +24,6 @@ use crate::app::state::WorkspaceCardArea;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
-/// Width reserved for the trailing new-space button (" + ").
-const NEW_SPACE_WIDTH: u16 = 3;
-
 /// Branch names longer than this are elided with `…` in the chip.
 const MAX_BRANCH_WIDTH: usize = 11;
 
@@ -322,16 +319,8 @@ pub(crate) fn compute_spaces_bar_areas(
     }
 
     let count = app.workspaces.len();
-    let new_space_reserved = if app.mouse_capture {
-        NEW_SPACE_WIDTH + 1
-    } else {
-        0
-    };
     let gaps = count.saturating_sub(1) as u16;
-    let avail = area
-        .width
-        .saturating_sub(new_space_reserved)
-        .saturating_sub(gaps);
+    let avail = area.width.saturating_sub(gaps);
 
     let naturals: Vec<u16> = (0..count)
         .map(|ws_idx| {
@@ -395,14 +384,8 @@ pub(crate) fn compute_spaces_bar_areas(
         x = x.saturating_add(width + 1);
     }
 
-    let new_space_hit_area = if app.mouse_capture {
-        let right = area.x + area.width;
-        Rect::new(right.saturating_sub(NEW_SPACE_WIDTH), area.y, NEW_SPACE_WIDTH, 1)
-    } else {
-        Rect::default()
-    };
-
-    (cards, new_space_hit_area)
+    // The new-space button floats at the top-right of the window now.
+    (cards, Rect::default())
 }
 
 /// Column of the drop indicator for a workspace drag: the left edge of the
@@ -455,13 +438,6 @@ pub(super) fn render_spaces_bar(
             1,
         );
         frame.render_widget(Paragraph::new(Line::from(line.spans)), line_rect);
-    }
-
-    if app.mouse_capture && app.view.new_space_hit_area.width > 0 {
-        frame.render_widget(
-            Paragraph::new(" + ").style(Style::default().fg(p.overlay1).bg(p.panel_bg)),
-            app.view.new_space_hit_area,
-        );
     }
 
     if let Some(crate::app::state::DragState {

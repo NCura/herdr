@@ -211,14 +211,33 @@ pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: R
     }
 }
 
-/// The "menu" launcher, floating at the top-right corner of the window over
-/// whatever pane content is underneath.
+/// The "+tab +space menu" cluster, floating at the top-right corner of the
+/// window over whatever pane content is underneath.
 pub(super) fn render_menu_launcher(app: &AppState, frame: &mut Frame) {
     let rect = app.global_launcher_rect();
     if rect.width == 0 || rect.height == 0 {
         return;
     }
     let p = &app.palette;
+
+    if app.mouse_capture {
+        let tab_rect = app.new_tab_button_rect();
+        if tab_rect.width > 0 {
+            frame.render_widget(
+                Paragraph::new(" +tab ")
+                    .style(Style::default().fg(p.overlay0).bg(p.panel_bg)),
+                tab_rect,
+            );
+        }
+        let space_rect = app.new_space_button_rect();
+        if space_rect.width > 0 {
+            frame.render_widget(
+                Paragraph::new(" +space ")
+                    .style(Style::default().fg(p.overlay0).bg(p.panel_bg)),
+                space_rect,
+            );
+        }
+    }
     let line = if app.global_menu_attention_badge_visible() {
         Line::from(vec![
             Span::styled(

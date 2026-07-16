@@ -157,6 +157,30 @@ impl AppState {
             return None;
         }
 
+        // Floating +tab / +space buttons, left of the menu launcher.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && launcher_enabled {
+            let contains = |rect: Rect| {
+                rect.width > 0
+                    && mouse.column >= rect.x
+                    && mouse.column < rect.x + rect.width
+                    && mouse.row >= rect.y
+                    && mouse.row < rect.y + rect.height
+            };
+            if contains(self.new_tab_button_rect()) {
+                if self.prompt_new_tab_name {
+                    open_new_tab_dialog(self);
+                } else {
+                    self.request_new_tab = true;
+                    self.mode = Mode::Terminal;
+                }
+                return None;
+            }
+            if contains(self.new_space_button_rect()) {
+                self.request_new_workspace = true;
+                return None;
+            }
+        }
+
         if self.mode == Mode::GlobalMenu {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 if let Some(action) = self.global_menu_item_at(mouse.column, mouse.row) {
@@ -515,15 +539,6 @@ impl AppState {
                     && mouse.row >= spaces_bar.y
                     && mouse.row < spaces_bar.y + spaces_bar.height;
                 if in_spaces_bar {
-                    let plus = self.view.new_space_hit_area;
-                    if plus.width > 0
-                        && mouse.column >= plus.x
-                        && mouse.column < plus.x + plus.width
-                        && mouse.row == plus.y
-                    {
-                        self.request_new_workspace = true;
-                        return None;
-                    }
                     if let Some((ws_idx, pane_id)) = crate::ui::spaces_bar_agent_dot_at(
                         self,
                         terminal_runtimes,
