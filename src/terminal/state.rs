@@ -87,6 +87,8 @@ pub struct TerminalState {
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
+    /// Name of the current foreground (non-shell) process, from the pane probe.
+    pub foreground_process_name: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
@@ -117,6 +119,7 @@ impl TerminalState {
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
             terminal_title: None,
+            foreground_process_name: None,
             manual_label: None,
             agent_name: None,
             hook_report_sequences: HashMap::new(),

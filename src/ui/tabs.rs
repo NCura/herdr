@@ -37,8 +37,9 @@ fn tab_width(ws: &crate::workspace::Workspace, tab_idx: usize) -> u16 {
 const MAX_TAB_ACTIVITY_WIDTH: usize = 20;
 
 /// What the tab is currently doing: the detected agent of the focused pane
-/// (then of any pane in the tab), falling back to the focused pane's stripped
-/// terminal title (how full-screen apps announce themselves).
+/// (then of any pane in the tab), falling back to the focused pane's
+/// foreground process name (from the pane probe), then its stripped terminal
+/// title.
 fn tab_activity_label(
     ws: &crate::workspace::Workspace,
     tab_idx: usize,
@@ -68,9 +69,11 @@ fn tab_activity_label(
     }
 
     let pane = tab.panes.get(&focused)?;
-    terminals
-        .get(&pane.attached_terminal_id)?
-        .terminal_title_stripped()
+    let terminal = terminals.get(&pane.attached_terminal_id)?;
+    terminal
+        .foreground_process_name
+        .clone()
+        .or_else(|| terminal.terminal_title_stripped())
 }
 
 /// Tabs are named by position; the current activity (agent or terminal

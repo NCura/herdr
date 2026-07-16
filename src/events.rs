@@ -56,6 +56,11 @@ pub struct WorktreeRemoveResult {
 pub enum AppEvent {
     /// A pane's child process exited.
     PaneDied { pane_id: PaneId },
+    /// The foreground (non-shell) process name changed in a pane.
+    ForegroundProcessChanged {
+        pane_id: PaneId,
+        name: Option<String>,
+    },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,

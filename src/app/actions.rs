@@ -2712,6 +2712,18 @@ impl AppState {
             // AppState. Kept for AppEvent exhaustiveness.
             AppEvent::ClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
+            AppEvent::ForegroundProcessChanged { pane_id, name } => {
+                let Some(terminal_id) = self.workspaces.iter().find_map(|ws| {
+                    ws.pane_state(pane_id)
+                        .map(|pane| pane.attached_terminal_id.clone())
+                }) else {
+                    return Vec::new();
+                };
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    terminal.foreground_process_name = name;
+                }
+                Vec::new()
+            }
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
                 if !cwd.is_absolute() || !cwd.is_dir() {
                     return Vec::new();

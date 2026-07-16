@@ -533,11 +533,20 @@ fn probe_foreground_process_from_jobs(
         }
 
         let identified = crate::detect::identify_agent_in_job(job);
+        // Even with no agent identified, keep the group leader's name so the
+        // UI can label the tab with whatever is running (lazygit, hx, ...).
+        let leader_name = job
+            .processes
+            .iter()
+            .find(|process| process.pid == job.process_group_id)
+            .map(|process| process.name.clone());
         return ProcessProbeResult {
             process_group_id: Some(job.process_group_id),
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
-            process_name: identified.map(|(_, process_name)| process_name),
+            process_name: identified
+                .map(|(_, process_name)| process_name)
+                .or(leader_name),
         };
     }
 
@@ -587,6 +596,7 @@ fn spawn_basic_detection_task(
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
         let mut has_process_probe = false;
+        let mut last_foreground_name: Option<String> = None;
         let mut acquisition_started_at = None;
         let mut last_content_change_at = None;
         let mut pending_foreground_shell_clear = false;
@@ -669,6 +679,18 @@ fn spawn_basic_detection_task(
                 let had_process_probe = has_process_probe;
                 has_process_probe = true;
                 let probe = probe_foreground_process(pid, foreground_pgid);
+                let foreground_name = if probe.foreground_is_pane_shell {
+                    None
+                } else {
+                    probe.process_name.clone()
+                };
+                if foreground_name != last_foreground_name {
+                    last_foreground_name = foreground_name.clone();
+                    let _ = state_events.try_send(AppEvent::ForegroundProcessChanged {
+                        pane_id,
+                        name: foreground_name,
+                    });
+                }
                 let process_group_id = probe.process_group_id;
                 let foreground_is_pane_shell = probe.foreground_is_pane_shell;
                 let mut new_agent = probe.agent;
@@ -1995,6 +2017,7 @@ impl PaneRuntime {
                 let mut last_process_check = Instant::now();
                 let mut last_foreground_pgid = None;
                 let mut has_process_probe = false;
+                let mut last_foreground_name: Option<String> = None;
                 let mut acquisition_started_at = None;
                 let mut last_content_change_at = None;
                 let mut pending_foreground_shell_clear = false;
@@ -2092,6 +2115,19 @@ impl PaneRuntime {
                         has_process_probe = true;
                         if pid > 0 {
                             let probe = probe_foreground_process(pid, foreground_pgid);
+                            let foreground_name = if probe.foreground_is_pane_shell {
+                                None
+                            } else {
+                                probe.process_name.clone()
+                            };
+                            if foreground_name != last_foreground_name {
+                                last_foreground_name = foreground_name.clone();
+                                let _ =
+                                    state_events.try_send(AppEvent::ForegroundProcessChanged {
+                                        pane_id,
+                                        name: foreground_name,
+                                    });
+                            }
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;
                             let foreground_is_pane_shell = probe.foreground_is_pane_shell;
