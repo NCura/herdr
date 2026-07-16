@@ -2508,6 +2508,10 @@ impl AppState {
                 ws.cached_git_ahead_behind = result.ahead_behind;
                 changed = true;
             }
+            if ws.cached_git_dirty != result.dirty {
+                ws.cached_git_dirty = result.dirty;
+                changed = true;
+            }
             if ws.cached_git_space != result.space {
                 ws.cached_git_space = result.space;
                 changed = true;
@@ -3652,6 +3656,7 @@ mod tests {
                 resolved_identity_cwd: first_cwd,
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
+                dirty: None,
                 space: None,
             }],
         );
@@ -3678,6 +3683,7 @@ mod tests {
                 resolved_identity_cwd: std::path::PathBuf::from("/definitely/not/current"),
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 1)),
+                dirty: None,
                 space: None,
             }],
         );
@@ -3703,6 +3709,7 @@ mod tests {
                 resolved_identity_cwd: cwd,
                 branch: None,
                 ahead_behind: None,
+                dirty: None,
                 space: None,
             }],
         );
@@ -3728,6 +3735,7 @@ mod tests {
                 resolved_identity_cwd: cwd,
                 branch: Some("scratch".into()),
                 ahead_behind: None,
+                dirty: None,
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "other-repo-key".into(),
                     checkout_key: "/other/checkout".into(),

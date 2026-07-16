@@ -2086,6 +2086,7 @@ mod tests {
                 resolved_identity_cwd,
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
+                dirty: None,
                 space: None,
             }],
             cache_updates: Vec::new(),
