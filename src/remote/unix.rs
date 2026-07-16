@@ -171,10 +171,11 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .remote
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
-    let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
+    let prepared_remote = prepare_remote_herdr(&remote_ssh, &session_name, remote.live_handoff)?;
     ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
+        &session_name,
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
@@ -671,6 +672,7 @@ impl InstallSource {
 
 fn prepare_remote_herdr(
     ssh: &RemoteSsh,
+    session_name: &str,
     live_handoff_enabled: bool,
 ) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(ssh)?;
@@ -706,6 +708,7 @@ fn prepare_remote_herdr(
         stop_after_install_approved = confirm_remote_install_with_running_server(
             ssh,
             status_probe_herdr,
+            session_name,
             live_handoff_enabled,
         )?;
     }
@@ -1029,11 +1032,12 @@ enum RemoteInstallRunningServerPlan {
 fn ensure_remote_server_ready(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
+    session_name: &str,
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
 ) -> io::Result<()> {
-    let status = remote_server_status(ssh, remote_herdr)?;
+    let status = remote_server_status(ssh, remote_herdr, session_name)?;
     let RemoteServerStatus::Running {
         version,
         protocol,
@@ -1054,7 +1058,7 @@ fn ensure_remote_server_ready(
     };
 
     if live_handoff_enabled && live_handoff {
-        match live_handoff_remote_server(ssh, remote_herdr) {
+        match live_handoff_remote_server(ssh, remote_herdr, session_name) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 eprintln!("remote live handoff failed: {err}");
@@ -1064,12 +1068,12 @@ fn ensure_remote_server_ready(
     }
 
     if stop_after_install_approved {
-        stop_remote_server(ssh, remote_herdr)?;
+        stop_remote_server(ssh, remote_herdr, session_name)?;
         return Ok(());
     }
 
     if confirm_remote_server_stop(ssh.target(), version.as_deref(), protocol, reason)? {
-        stop_remote_server(ssh, remote_herdr)?;
+        stop_remote_server(ssh, remote_herdr, session_name)?;
     }
     Ok(())
 }
@@ -1098,10 +1102,11 @@ fn remote_server_restart_reason(
 fn confirm_remote_install_with_running_server(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
+    session_name: &str,
     live_handoff_enabled: bool,
 ) -> io::Result<bool> {
     let target = ssh.target();
-    let status = match remote_server_status(ssh, remote_herdr) {
+    let status = match remote_server_status(ssh, remote_herdr, session_name) {
         Ok(status) => status,
         Err(err) => {
             if !io::stdin().is_terminal() {
@@ -1230,11 +1235,26 @@ fn remote_install_running_server_plan(
     RemoteInstallRunningServerPlan::StopRequired(reason)
 }
 
+/// " --session <name>" for non-default sessions; remote probes and stops
+/// must target the same session the attach will use, not the default one.
+fn session_flag(session_name: &str) -> String {
+    if session_name == crate::session::DEFAULT_SESSION_NAME {
+        String::new()
+    } else {
+        format!(" --session {}", shell_quote(session_name))
+    }
+}
+
 fn remote_server_status(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
+    session_name: &str,
 ) -> io::Result<RemoteServerStatus> {
-    let command = format!("{} status server --json", remote_herdr.shell_path);
+    let command = format!(
+        "{}{} status server --json",
+        remote_herdr.shell_path,
+        session_flag(session_name)
+    );
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server status failed", &output));
@@ -1366,10 +1386,15 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
-fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn live_handoff_remote_server(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<()> {
     let command = format!(
-        "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
+        "{}{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
         remote_herdr.shell_path,
+        session_flag(session_name),
         remote_herdr.shell_path,
         CURRENT_PROTOCOL,
         current_version()
@@ -1386,14 +1411,22 @@ fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io
     Ok(())
 }
 
-fn stop_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
-    let command = format!("{} server stop", remote_herdr.shell_path);
+fn stop_remote_server(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<()> {
+    let command = format!(
+        "{}{} server stop",
+        remote_herdr.shell_path,
+        session_flag(session_name)
+    );
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server stop failed", &output));
     }
 
-    wait_for_remote_server_shutdown(ssh, remote_herdr)?;
+    wait_for_remote_server_shutdown(ssh, remote_herdr, session_name)?;
     eprintln!(
         "stopped the remote herdr server on {}; it will restart when the remote client bridge attaches.",
         ssh.target()
@@ -1401,10 +1434,14 @@ fn stop_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result
     Ok(())
 }
 
-fn wait_for_remote_server_shutdown(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn wait_for_remote_server_shutdown(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<()> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
-        if remote_server_status(ssh, remote_herdr)? == RemoteServerStatus::NotRunning {
+        if remote_server_status(ssh, remote_herdr, session_name)? == RemoteServerStatus::NotRunning {
             return Ok(());
         }
         if Instant::now() >= deadline {
