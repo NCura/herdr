@@ -185,15 +185,19 @@ impl AppState {
             return self.view.mobile_menu_hit_area;
         }
 
-        let footer = self.sidebar_footer_rect();
+        // Far right of the bottom spaces bar row.
+        let bar = self.view.spaces_bar_rect;
+        if bar.width == 0 || bar.height == 0 {
+            return Rect::default();
+        }
         let width = if self.global_menu_attention_badge_visible() {
             8
         } else {
             6
         }
-        .min(footer.width.max(1));
-        let x = footer.x + footer.width.saturating_sub(width);
-        Rect::new(x, footer.y, width, footer.height)
+        .min(bar.width.max(1));
+        let x = bar.x + bar.width.saturating_sub(width);
+        Rect::new(x, bar.y, width, 1)
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {

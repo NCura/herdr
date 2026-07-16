@@ -2,7 +2,7 @@
 //! replacing the vertical sidebar. Names truncate to fit the available width.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -52,7 +52,16 @@ pub(crate) fn compute_spaces_bar_areas(
 
     let labels = workspace_chip_labels(app, terminal_runtimes);
     let new_space_reserved = if app.mouse_capture { NEW_SPACE_WIDTH } else { 0 };
-    let avail = area.width.saturating_sub(new_space_reserved);
+    // The global menu launcher sits at the far right of the bar.
+    let menu_reserved = if app.global_menu_attention_badge_visible() {
+        8
+    } else {
+        6
+    };
+    let avail = area
+        .width
+        .saturating_sub(new_space_reserved)
+        .saturating_sub(menu_reserved);
 
     let naturals: Vec<u16> = labels.iter().map(|l| natural_chip_width(l)).collect();
     let total: u16 = naturals
@@ -78,12 +87,8 @@ pub(crate) fn compute_spaces_bar_areas(
     }
 
     let new_space_hit_area = if app.mouse_capture {
-        Rect::new(
-            x,
-            area.y,
-            (area.x + area.width).saturating_sub(x).min(NEW_SPACE_WIDTH),
-            1,
-        )
+        let chrome_right = (area.x + area.width).saturating_sub(menu_reserved);
+        Rect::new(x, area.y, chrome_right.saturating_sub(x).min(NEW_SPACE_WIDTH), 1)
     } else {
         Rect::default()
     };
@@ -159,6 +164,25 @@ pub(super) fn render_spaces_bar(
         frame.render_widget(
             Paragraph::new(" + ").style(Style::default().fg(p.overlay1).bg(p.panel_bg)),
             app.view.new_space_hit_area,
+        );
+    }
+
+    let menu_rect = app.global_launcher_rect();
+    if menu_rect.width > 0 {
+        let menu_line = if app.global_menu_attention_badge_visible() {
+            Line::from(vec![
+                Span::styled(
+                    "● ",
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("menu", Style::default().fg(p.overlay0)),
+            ])
+        } else {
+            Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay0))])
+        };
+        frame.render_widget(
+            Paragraph::new(menu_line).alignment(Alignment::Right),
+            menu_rect,
         );
     }
 }

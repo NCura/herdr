@@ -203,8 +203,8 @@ fn desktop_tab_bar_and_terminal_area(
 ) -> (Rect, Rect) {
     let hide_single_tab_bar = app.hide_tab_bar_when_single_tab && ws.tabs.len() == 1;
     if !hide_single_tab_bar && main_area.height > 1 {
-        let [tab_bar_rect, terminal_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main_area);
+        let [terminal_area, tab_bar_rect] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(main_area);
         (tab_bar_rect, terminal_area)
     } else {
         (Rect::default(), main_area)
@@ -223,11 +223,11 @@ fn compute_view_internal(
         return;
     }
 
-    // Spaces live in a single horizontal row at the top instead of a vertical
-    // sidebar; the agents panel is hidden for now. The old sidebar code paths
+    // Bottom-up chrome: pane body on top, tab bar under it, spaces bar as the
+    // bottom row; the agents panel is hidden for now. The old sidebar code paths
     // stay compiled but inert (sidebar_rect is zero, so `in_sidebar` never hits).
-    let [spaces_bar_area, main_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    let [main_area, spaces_bar_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
     let (tab_bar_rect, terminal_area) = app
         .active
