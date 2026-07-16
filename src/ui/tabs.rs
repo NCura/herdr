@@ -94,7 +94,7 @@ fn tab_chrome_label(
         .or_else(|| tab_activity_label(ws, tab_idx, terminals))
         .map(|activity| truncate_end(&activity, MAX_TAB_ACTIVITY_WIDTH));
     let name = match suffix {
-        Some(activity) => format!("{number} {activity}"),
+        Some(activity) => format!("{number} - {activity}"),
         None => number.to_string(),
     };
     if ws.tabs.get(tab_idx).is_some_and(|tab| tab.zoomed) {

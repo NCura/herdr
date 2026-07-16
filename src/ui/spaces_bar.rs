@@ -139,14 +139,17 @@ fn build_chip_line(
         })
         .bg(bg);
 
-    // Dots render as "● ● ●": one cell per dot, one gap between dots.
+    // Dots render as "● ● ●" at the end of the chip: one cell per dot, one
+    // gap between dots.
     let dots = agent_dots(ws, &app.terminals);
-    let dots_width = if dots.is_empty() {
+    let dots_block_width = if dots.is_empty() {
         1
     } else {
         (dots.len() * 2 - 1) as u16
     };
 
+    // Chips read "<position> - <name> ...", matching the tab labels.
+    let number_prefix = format!("{} - ", ws_idx + 1);
     let name_full = ws.display_name_from(&app.terminals, terminal_runtimes);
     let git = ws.branch().map(|branch| ChipGit {
         branch: truncate_end(&branch, MAX_BRANCH_WIDTH),
@@ -157,27 +160,17 @@ fn build_chip_line(
 
     // Fit content into the chip: the name wins, then the dirty marker, then
     // the ahead/behind counters; the branch shrinks or drops first.
-    let content_budget = chip_width.saturating_sub(CHIP_BASE_CHROME_WIDTH + dots_width) as usize;
+    let content_budget = chip_width.saturating_sub(
+        CHIP_BASE_CHROME_WIDTH + dots_block_width + display_width_u16(&number_prefix),
+    ) as usize;
     let name = truncate_end(&name_full, content_budget);
     let mut budget = content_budget.saturating_sub(display_width_u16(&name) as usize);
 
-    let mut spans = vec![Span::styled(" ", Style::default().bg(bg))];
-    let mut dot_offsets = Vec::with_capacity(dots.len());
-    if dots.is_empty() {
-        let (dot, dot_style) = state_dot(crate::detect::AgentState::Unknown, true, p);
-        spans.push(Span::styled(dot, dot_style.bg(bg)));
-    } else {
-        for (i, (pane_id, state, seen)) in dots.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" ", Style::default().bg(bg)));
-            }
-            dot_offsets.push((*pane_id, 1 + 2 * i as u16));
-            let (dot, dot_style) = state_dot(*state, *seen, p);
-            spans.push(Span::styled(dot, dot_style.bg(bg)));
-        }
-    }
-    spans.push(Span::styled(" ", Style::default().bg(bg)));
-    spans.push(Span::styled(name, name_style));
+    let mut spans = vec![
+        Span::styled(" ", Style::default().bg(bg)),
+        Span::styled(number_prefix, name_style),
+        Span::styled(name, name_style),
+    ];
 
     if let Some(git) = &git {
         let dirty_w = git.dirty_width() as usize;
@@ -222,12 +215,34 @@ fn build_chip_line(
             }
         }
     }
+    // Agent dots close the chip.
+    spans.push(Span::styled(" ", Style::default().bg(bg)));
+    if dots.is_empty() {
+        let (dot, dot_style) = state_dot(crate::detect::AgentState::Unknown, true, p);
+        spans.push(Span::styled(dot, dot_style.bg(bg)));
+    } else {
+        for (i, (_, state, seen)) in dots.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" ", Style::default().bg(bg)));
+            }
+            let (dot, dot_style) = state_dot(*state, *seen, p);
+            spans.push(Span::styled(dot, dot_style.bg(bg)));
+        }
+    }
     spans.push(Span::styled(" ", Style::default().bg(bg)));
 
     let width = spans
         .iter()
         .map(|span| display_width_u16(&span.content))
         .fold(0u16, |acc, w| acc.saturating_add(w));
+
+    // The dots block sits right before the trailing pad.
+    let first_dot_offset = width.saturating_sub(1 + dots_block_width);
+    let dot_offsets = dots
+        .iter()
+        .enumerate()
+        .map(|(i, (pane_id, _, _))| (*pane_id, first_dot_offset + 2 * i as u16))
+        .collect();
 
     Some(ChipLine {
         spans,
