@@ -78,6 +78,31 @@ fn tab_activity_label(
 
 /// Tabs are named by position; the current activity (agent or terminal
 /// title) rides along as a suffix, and a manual rename replaces the suffix.
+/// Returns (position number, suffix including the zoom marker).
+fn tab_label_parts(
+    ws: &crate::workspace::Workspace,
+    tab_idx: usize,
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+) -> (usize, Option<String>) {
+    let number = tab_idx + 1;
+    let mut suffix = ws
+        .tabs
+        .get(tab_idx)
+        .and_then(|tab| tab.custom_name.clone())
+        .or_else(|| tab_activity_label(ws, tab_idx, terminals))
+        .map(|activity| truncate_end(&activity, MAX_TAB_ACTIVITY_WIDTH));
+    if ws.tabs.get(tab_idx).is_some_and(|tab| tab.zoomed) {
+        suffix = Some(match suffix {
+            Some(activity) => format!("{activity} Z"),
+            None => "Z".to_string(),
+        });
+    }
+    (number, suffix)
+}
+
 fn tab_chrome_label(
     ws: &crate::workspace::Workspace,
     tab_idx: usize,
@@ -86,21 +111,9 @@ fn tab_chrome_label(
         crate::terminal::TerminalState,
     >,
 ) -> String {
-    let number = tab_idx + 1;
-    let suffix = ws
-        .tabs
-        .get(tab_idx)
-        .and_then(|tab| tab.custom_name.clone())
-        .or_else(|| tab_activity_label(ws, tab_idx, terminals))
-        .map(|activity| truncate_end(&activity, MAX_TAB_ACTIVITY_WIDTH));
-    let name = match suffix {
-        Some(activity) => format!("{number} - {activity}"),
-        None => number.to_string(),
-    };
-    if ws.tabs.get(tab_idx).is_some_and(|tab| tab.zoomed) {
-        format!("{name} Z")
-    } else {
-        name
+    match tab_label_parts(ws, tab_idx, terminals) {
+        (number, Some(suffix)) => format!("{number} - {suffix}"),
+        (number, None) => number.to_string(),
     }
 }
 
@@ -203,20 +216,21 @@ pub(crate) fn compute_tab_bar_view(
     }
 
     let area_right = area.x + area.width;
+    // One cell of breathing room between the last tab and the + button.
     let all_tabs_area = Rect::new(
         area.x,
         area.y,
-        area.width.saturating_sub(NEW_TAB_WIDTH),
+        area.width.saturating_sub(NEW_TAB_WIDTH + 1),
         area.height,
     );
     let all_tabs = layout_tab_hit_areas(ws, all_tabs_area, 0);
     let overflow = all_tabs.iter().any(|rect| rect.width == 0);
     if !overflow {
-        let new_tab_x = trailing_tab_controls_x(&all_tabs, area.x);
+        // Pinned to the right edge, like the spaces row's + button.
         let new_tab_hit_area = Rect::new(
-            new_tab_x,
+            area_right.saturating_sub(NEW_TAB_WIDTH.min(area.width)),
             area.y,
-            area_right.saturating_sub(new_tab_x).min(NEW_TAB_WIDTH),
+            NEW_TAB_WIDTH.min(area.width),
             1,
         );
         return TabBarView {
@@ -404,10 +418,28 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         } else {
             Style::default().fg(p.overlay1).bg(p.surface0)
         };
-        let name = tab_chrome_label(ws, idx, &app.terminals);
-        let name = truncate_end(&name, (rect.width as usize).saturating_sub(2));
+        // Dim the position prefix so the activity name carries the label.
+        let (number, suffix) = tab_label_parts(ws, idx, &app.terminals);
+        let avail = (rect.width as usize).saturating_sub(2);
+        let line = match suffix {
+            Some(activity) => {
+                let prefix = format!("{number} - ");
+                let activity = truncate_end(
+                    &activity,
+                    avail.saturating_sub(super::text::display_width(&prefix)),
+                );
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(prefix, style.add_modifier(Modifier::DIM)),
+                    ratatui::text::Span::styled(activity, style),
+                ])
+            }
+            None => ratatui::text::Line::from(ratatui::text::Span::styled(
+                truncate_end(&number.to_string(), avail),
+                style,
+            )),
+        };
         frame.render_widget(
-            Paragraph::new(name).alignment(Alignment::Center).style(style),
+            Paragraph::new(line).alignment(Alignment::Center).style(style),
             rect,
         );
     }

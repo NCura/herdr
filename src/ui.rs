@@ -252,7 +252,7 @@ fn compute_view_internal(
     app.agent_panel_scroll = 0;
 
     let (workspace_card_areas, new_space_hit_area) =
-        compute_spaces_bar_areas(app, spaces_bar_area);
+        compute_spaces_bar_areas(app, terminal_runtimes, spaces_bar_area);
 
     let tab_bar_view = app
         .active

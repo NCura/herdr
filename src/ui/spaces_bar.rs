@@ -29,9 +29,12 @@ const NEW_SPACE_WIDTH: u16 = 3;
 /// Branch names longer than this are elided with `…` in the chip.
 const MAX_BRANCH_WIDTH: usize = 11;
 
-/// Chip chrome besides the agent dots: leading pad, gap after the dots,
-/// trailing pad.
-const CHIP_BASE_CHROME_WIDTH: u16 = 3;
+/// Chip chrome besides the agent dots: leading and trailing pad.
+const CHIP_BASE_CHROME_WIDTH: u16 = 2;
+
+/// Minimum useful branch width: below this the branch drops entirely
+/// instead of degrading into a one-letter stub like "d…".
+const MIN_BRANCH_WIDTH: usize = 5;
 
 struct ChipGit {
     branch: String,
@@ -123,7 +126,14 @@ fn build_chip_line(
     } else {
         p.panel_bg
     };
-    let name_style = if selected || is_active {
+    // The active space's name takes the accent color so both bars answer
+    // "where am I" with the same visual cue as the active tab.
+    let name_style = if is_active {
+        Style::default()
+            .fg(p.accent)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
         Style::default()
             .fg(p.text)
             .bg(bg)
@@ -131,6 +141,7 @@ fn build_chip_line(
     } else {
         Style::default().fg(p.subtext0).bg(bg)
     };
+    let prefix_style = Style::default().fg(p.overlay0).bg(bg);
     let branch_style = Style::default()
         .fg(if selected || is_active {
             p.mauve
@@ -140,12 +151,14 @@ fn build_chip_line(
         .bg(bg);
 
     // Dots render as "● ● ●" at the end of the chip: one cell per dot, one
-    // gap between dots.
+    // gap between dots. No dots at all for agent-less workspaces — the
+    // signal should stand out, not the absence of one. Width includes the
+    // gap separating the block from the name/git content.
     let dots = agent_dots(ws, &app.terminals);
     let dots_block_width = if dots.is_empty() {
-        1
+        0
     } else {
-        (dots.len() * 2 - 1) as u16
+        (dots.len() * 2) as u16
     };
 
     // Chips read "<position> - <name> ...", matching the tab labels.
@@ -168,7 +181,7 @@ fn build_chip_line(
 
     let mut spans = vec![
         Span::styled(" ", Style::default().bg(bg)),
-        Span::styled(number_prefix, name_style),
+        Span::styled(number_prefix, prefix_style),
         Span::styled(name, name_style),
     ];
 
@@ -183,9 +196,9 @@ fn build_chip_line(
         if show_arrows {
             budget -= arrows_w;
         }
-        // Leading gap + at least two branch cells, otherwise drop it.
+        // Leading gap + a usefully-wide branch, otherwise drop it entirely.
         let branch_avail = budget.saturating_sub(1);
-        if branch_avail >= 2 {
+        if branch_avail >= MIN_BRANCH_WIDTH {
             spans.push(Span::styled(" ", Style::default().bg(bg)));
             spans.push(Span::styled(
                 truncate_end(&git.branch, branch_avail),
@@ -215,16 +228,10 @@ fn build_chip_line(
             }
         }
     }
-    // Agent dots close the chip.
-    spans.push(Span::styled(" ", Style::default().bg(bg)));
-    if dots.is_empty() {
-        let (dot, dot_style) = state_dot(crate::detect::AgentState::Unknown, true, p);
-        spans.push(Span::styled(dot, dot_style.bg(bg)));
-    } else {
-        for (i, (_, state, seen)) in dots.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" ", Style::default().bg(bg)));
-            }
+    // Agent dots close the chip; agent-less chips end after their content.
+    if !dots.is_empty() {
+        for (_, state, seen) in &dots {
+            spans.push(Span::styled(" ", Style::default().bg(bg)));
             let (dot, dot_style) = state_dot(*state, *seen, p);
             spans.push(Span::styled(dot, dot_style.bg(bg)));
         }
@@ -236,8 +243,9 @@ fn build_chip_line(
         .map(|span| display_width_u16(&span.content))
         .fold(0u16, |acc, w| acc.saturating_add(w));
 
-    // The dots block sits right before the trailing pad.
-    let first_dot_offset = width.saturating_sub(1 + dots_block_width);
+    // The dots block ("· ● ● …" without its leading gap) sits right before
+    // the trailing pad; the first dot lands one cell into the block.
+    let first_dot_offset = width.saturating_sub(dots_block_width);
     let dot_offsets = dots
         .iter()
         .enumerate()
@@ -280,37 +288,99 @@ pub(crate) fn spaces_bar_agent_dot_at(
     })
 }
 
-/// Lay the workspaces out left-to-right in `area`, splitting the row into
-/// equal shares: one chip takes the full width, two chips take half each, and
-/// so on. The new-space button keeps the right edge. Returns the
-/// per-workspace hit rects plus the new-space button rect.
-pub(crate) fn compute_spaces_bar_areas(app: &AppState, area: Rect) -> (Vec<WorkspaceCardArea>, Rect) {
+/// Lay the workspaces out left-to-right in `area` with a 1-cell gap between
+/// chips. Every chip gets its natural width first; leftover row space is
+/// distributed equally (so the row still fills edge-to-edge), and when the
+/// row overflows, chips with short content keep their natural width while
+/// long ones split what remains fairly. The new-space button keeps the right
+/// edge with one cell of breathing room. Returns the per-workspace hit rects
+/// plus the new-space button rect.
+pub(crate) fn compute_spaces_bar_areas(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+) -> (Vec<WorkspaceCardArea>, Rect) {
     if area.width == 0 || area.height == 0 || app.workspaces.is_empty() {
         return (Vec::new(), Rect::default());
     }
 
-    let count = app.workspaces.len() as u16;
-    let new_space_reserved = if app.mouse_capture { NEW_SPACE_WIDTH } else { 0 };
-    let avail = area.width.saturating_sub(new_space_reserved);
+    let count = app.workspaces.len();
+    let new_space_reserved = if app.mouse_capture {
+        NEW_SPACE_WIDTH + 1
+    } else {
+        0
+    };
+    let gaps = count.saturating_sub(1) as u16;
+    let avail = area
+        .width
+        .saturating_sub(new_space_reserved)
+        .saturating_sub(gaps);
 
-    let base = avail / count;
-    let extra = avail % count;
+    let naturals: Vec<u16> = (0..count)
+        .map(|ws_idx| {
+            build_chip_line(app, terminal_runtimes, ws_idx, u16::MAX)
+                .map_or(0, |line| line.width)
+        })
+        .collect();
+    let total: u16 = naturals
+        .iter()
+        .fold(0u16, |acc, w| acc.saturating_add(*w));
 
-    let mut cards = Vec::with_capacity(count as usize);
+    let mut widths = naturals.clone();
+    if total <= avail {
+        // Surplus: everyone grows by an equal share.
+        let surplus = avail - total;
+        let per = surplus / count as u16;
+        let extra = surplus % count as u16;
+        for (i, width) in widths.iter_mut().enumerate() {
+            *width += per + u16::from((i as u16) < extra);
+        }
+    } else {
+        // Deficit: waterfill from the smallest chip up — short chips keep
+        // their natural width, long ones split the remainder fairly.
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by_key(|&i| naturals[i]);
+        let mut remaining = avail;
+        let mut left = count as u16;
+        for &i in &order {
+            let fair = remaining / left.max(1);
+            widths[i] = naturals[i].min(fair);
+            remaining -= widths[i];
+            left -= 1;
+        }
+        // Hand rounding leftovers to chips still below their natural width.
+        while remaining > 0 {
+            let mut progressed = false;
+            for i in 0..count {
+                if remaining == 0 {
+                    break;
+                }
+                if widths[i] < naturals[i] {
+                    widths[i] += 1;
+                    remaining -= 1;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    let mut cards = Vec::with_capacity(count);
     let mut x = area.x;
-    for ws_idx in 0..count {
-        let width = base + u16::from(ws_idx < extra);
+    for (ws_idx, width) in widths.iter().enumerate() {
         cards.push(WorkspaceCardArea {
-            ws_idx: ws_idx as usize,
-            rect: Rect::new(x, area.y, width, 1),
+            ws_idx,
+            rect: Rect::new(x, area.y, *width, 1),
             indented: false,
         });
-        x = x.saturating_add(width);
+        x = x.saturating_add(width + 1);
     }
 
     let new_space_hit_area = if app.mouse_capture {
-        let chrome_right = area.x + area.width;
-        Rect::new(x, area.y, chrome_right.saturating_sub(x).min(NEW_SPACE_WIDTH), 1)
+        let right = area.x + area.width;
+        Rect::new(right.saturating_sub(NEW_SPACE_WIDTH), area.y, NEW_SPACE_WIDTH, 1)
     } else {
         Rect::default()
     };
