@@ -181,7 +181,8 @@ fn build_chip_line(
     let content_budget = chip_width.saturating_sub(
         CHIP_BASE_CHROME_WIDTH + dots_block_width + display_width_u16(&number_prefix),
     ) as usize;
-    let name = truncate_end(&name_full, content_budget);
+    let dirty_width = git.as_ref().map_or(0, |git| git.dirty_width()) as usize;
+    let name = truncate_end(&name_full, content_budget.saturating_sub(dirty_width));
     let mut budget = content_budget.saturating_sub(display_width_u16(&name) as usize);
 
     let mut spans = vec![
@@ -434,5 +435,31 @@ pub(super) fn render_spaces_bar(
                 .set_symbol("│")
                 .set_style(Style::default().fg(p.accent));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::Workspace;
+
+    #[test]
+    fn truncated_workspace_name_keeps_dirty_marker() {
+        let mut app = AppState::test_new();
+        let mut workspace = Workspace::test_new("my-very-long-name");
+        workspace.cached_git_branch = Some("main".into());
+        workspace.cached_git_dirty = Some(true);
+        app.workspaces = vec![workspace];
+
+        let line = build_chip_line(&app, &TerminalRuntimeRegistry::new(), 0, 16)
+            .expect("workspace chip should be built");
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("…*"), "chip text: {text:?}");
+        assert!(line.width <= 16, "chip width: {}", line.width);
     }
 }
