@@ -17,7 +17,7 @@ use ratatui::{
     Frame,
 };
 
-use super::status::state_dot;
+use super::status::{agent_icon, agent_icon_on_accent};
 use super::text::{display_width_u16, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::state::WorkspaceCardArea;
@@ -102,9 +102,9 @@ fn build_chip_line(
     let selected = ws_idx == app.selected && is_navigating;
     let is_active = Some(ws_idx) == app.active;
 
-    // The active space gets the exact same treatment as the active tab:
-    // accent background, contrast foreground. Colored glyphs (dirty star,
-    // arrows) switch to the contrast fg there — they'd drown on accent.
+    // The active space gets the exact same accent-filled treatment as the
+    // active tab. Status indicators receive hue-preserving contrast variants
+    // below so their state remains recognizable on the accent background.
     let contrast = panel_contrast_fg(p);
     let bg = if is_active {
         p.accent
@@ -155,10 +155,10 @@ fn build_chip_line(
         .fg(if is_active { contrast } else { p.red })
         .bg(bg);
 
-    // Dots render as "● ● ●" at the end of the chip: one cell per dot, one
-    // gap between dots. No dots at all for agent-less workspaces — the
-    // signal should stand out, not the absence of one. Width includes the
-    // gap separating the block from the name/git content.
+    // Status indicators render at the end of the chip: one cell per agent,
+    // one gap between indicators. No indicators at all for agent-less
+    // workspaces — the signal should stand out, not the absence of one.
+    // Width includes the gap separating the block from the name/git content.
     let dots = agent_dots(ws, &app.terminals);
     let dots_block_width = if dots.is_empty() {
         0
@@ -228,12 +228,17 @@ fn build_chip_line(
             }
         }
     }
-    // Agent dots close the chip; agent-less chips end after their content.
+    // Working agents use the same animated spinner as the agent panel. Active
+    // indicators keep their semantic hue but shift luminance for contrast.
     if !dots.is_empty() {
         for (_, state, seen) in &dots {
             spans.push(Span::styled(" ", Style::default().bg(bg)));
-            let (dot, dot_style) = state_dot(*state, *seen, p);
-            spans.push(Span::styled(dot, dot_style.bg(bg)));
+            let (indicator, indicator_style) = if is_active {
+                agent_icon_on_accent(*state, *seen, app.spinner_tick, p)
+            } else {
+                agent_icon(*state, *seen, app.spinner_tick, p)
+            };
+            spans.push(Span::styled(indicator, indicator_style.bg(bg)));
         }
     }
     spans.push(Span::styled(" ", Style::default().bg(bg)));
@@ -461,5 +466,100 @@ mod tests {
 
         assert!(text.contains("…*"), "chip text: {text:?}");
         assert!(line.width <= 16, "chip width: {}", line.width);
+    }
+
+    #[test]
+    fn active_workspace_contrast_adjusts_working_color_on_accent_background() {
+        let mut app = AppState::test_new();
+        app.palette.accent = app.palette.peach;
+        app.workspaces = vec![Workspace::test_new("test")];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal should exist");
+        terminal.detected_agent = Some(crate::detect::Agent::Claude);
+        terminal.state = crate::detect::AgentState::Working;
+
+        let line = build_chip_line(&app, &TerminalRuntimeRegistry::new(), 0, 30)
+            .expect("workspace chip should be built");
+        let spinner = super::super::spinner_frame(app.spinner_tick);
+        let spinner_idx = line
+            .spans
+            .iter()
+            .position(|span| span.content.as_ref() == spinner)
+            .expect("working workspace should show a spinner");
+
+        for span in &line.spans[spinner_idx - 1..=spinner_idx + 1] {
+            assert_eq!(span.style.bg, Some(app.palette.accent));
+        }
+        let (_, expected_style) = agent_icon_on_accent(
+            crate::detect::AgentState::Working,
+            false,
+            app.spinner_tick,
+            &app.palette,
+        );
+        assert_eq!(line.spans[spinner_idx].style.fg, expected_style.fg);
+        assert_ne!(line.spans[spinner_idx].style.fg, Some(app.palette.yellow));
+    }
+
+    #[test]
+    fn active_and_inactive_workspaces_use_teal_done_variants() {
+        let mut app = AppState::test_new();
+        app.palette.accent = app.palette.peach;
+        app.workspaces = vec![
+            Workspace::test_new("active"),
+            Workspace::test_new("inactive"),
+        ];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        for ws_idx in 0..app.workspaces.len() {
+            let pane_id = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            app.workspaces[ws_idx].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .expect("test pane should exist")
+                .seen = false;
+            let terminal = app
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("test terminal should exist");
+            terminal.detected_agent = Some(crate::detect::Agent::Claude);
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+
+        let runtime_registry = TerminalRuntimeRegistry::new();
+        let active = build_chip_line(&app, &runtime_registry, 0, 30)
+            .expect("active workspace chip should be built");
+        let inactive = build_chip_line(&app, &runtime_registry, 1, 30)
+            .expect("inactive workspace chip should be built");
+        let done_style = |line: &ChipLine| {
+            line.spans
+                .iter()
+                .find(|span| span.content.as_ref() == "●")
+                .expect("done workspace should show a filled circle")
+                .style
+        };
+
+        let (_, active_done_style) = agent_icon_on_accent(
+            crate::detect::AgentState::Idle,
+            false,
+            app.spinner_tick,
+            &app.palette,
+        );
+        assert_eq!(done_style(&active).fg, active_done_style.fg);
+        assert_eq!(done_style(&inactive).fg, Some(app.palette.teal));
+        assert_ne!(done_style(&active).fg, done_style(&inactive).fg);
+        assert_eq!(done_style(&active).bg, Some(app.palette.accent));
+        assert_eq!(done_style(&inactive).bg, Some(app.palette.panel_bg));
     }
 }

@@ -5,7 +5,7 @@ use ratatui::{
     Frame,
 };
 
-use super::status::state_dot;
+use super::status::{agent_icon, agent_icon_on_accent};
 use super::text::{display_width_u16, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::AppState;
@@ -440,9 +440,11 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
             Style::default().fg(p.overlay1).bg(p.surface0)
         };
         // Dim the position prefix so the activity name carries the label.
+        let prefix_style = style.add_modifier(Modifier::DIM);
         let (number, suffix) = tab_label_parts(ws, idx, &app.terminals);
-        // Dots render as " ●" per detected agent after the label, matching
-        // the spaces-bar chips; agent-less tabs end after their label.
+        // Status indicators render as " <icon>" per detected agent after the
+        // label, matching the spaces-bar chips. Working agents animate with
+        // the same spinner as the agent panel.
         let dots = tab_agent_dots(ws, idx, &app.terminals);
         let dots_block_width = dots.len() * 2;
         let avail = (rect.width as usize).saturating_sub(2 + dots_block_width);
@@ -454,21 +456,26 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
                     avail.saturating_sub(super::text::display_width(&prefix)),
                 );
                 vec![
-                    ratatui::text::Span::styled(prefix, style.add_modifier(Modifier::DIM)),
+                    ratatui::text::Span::styled(prefix, prefix_style),
                     ratatui::text::Span::styled(activity, style),
                 ]
             }
             None => vec![ratatui::text::Span::styled(
                 truncate_end(&number.to_string(), avail),
-                style,
+                prefix_style,
             )],
         };
+        let status_bg = style.bg.unwrap_or(p.surface0);
         for (_, state, seen) in &dots {
             spans.push(ratatui::text::Span::styled(" ", style));
-            let (dot, dot_style) = state_dot(*state, *seen, p);
+            let (indicator, indicator_style) = if active {
+                agent_icon_on_accent(*state, *seen, app.spinner_tick, p)
+            } else {
+                agent_icon(*state, *seen, app.spinner_tick, p)
+            };
             spans.push(ratatui::text::Span::styled(
-                dot,
-                dot_style.bg(style.bg.unwrap_or(p.surface0)),
+                indicator,
+                indicator_style.bg(status_bg),
             ));
         }
         let line = ratatui::text::Line::from(spans);
@@ -615,8 +622,9 @@ mod tests {
     }
 
     #[test]
-    fn tab_bar_shows_state_dot_for_tab_with_agent() {
+    fn active_tab_contrast_adjusts_working_color_on_accent_background() {
         let mut app = AppState::test_new();
+        app.palette.accent = app.palette.peach;
         let mut ws = Workspace::test_new("test");
         ws.test_add_tab(None);
         app.workspaces = vec![ws];
@@ -643,15 +651,27 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let agent_tab = app.view.tab_hit_areas[0];
-        let dot_x = (agent_tab.x..agent_tab.x + agent_tab.width)
-            .find(|&x| buffer[(x, 0)].symbol() == "●")
-            .expect("agent tab should show a state dot");
-        assert_eq!(buffer[(dot_x, 0)].style().fg, Some(app.palette.yellow));
+        let spinner = super::super::spinner_frame(app.spinner_tick);
+        let spinner_x = (agent_tab.x..agent_tab.x + agent_tab.width)
+            .find(|&x| buffer[(x, 0)].symbol() == spinner)
+            .expect("agent tab should show a working spinner");
+        let (_, expected_style) = agent_icon_on_accent(
+            crate::detect::AgentState::Working,
+            false,
+            app.spinner_tick,
+            &app.palette,
+        );
+        assert_eq!(buffer[(spinner_x, 0)].style().fg, expected_style.fg);
+        assert_ne!(buffer[(spinner_x, 0)].style().fg, Some(app.palette.yellow));
+        for x in spinner_x - 1..=spinner_x + 1 {
+            assert_eq!(buffer[(x, 0)].style().bg, Some(app.palette.accent));
+        }
 
         let plain_tab = app.view.tab_hit_areas[1];
         assert!(
-            (plain_tab.x..plain_tab.x + plain_tab.width).all(|x| buffer[(x, 0)].symbol() != "●"),
-            "agent-less tab should not show a dot"
+            (plain_tab.x..plain_tab.x + plain_tab.width)
+                .all(|x| buffer[(x, 0)].symbol() != spinner),
+            "agent-less tab should not show a spinner"
         );
     }
 

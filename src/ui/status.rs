@@ -218,6 +218,89 @@ pub(super) fn agent_icon(
     }
 }
 
+/// Preserve a status color's hue while shifting its luminance enough to remain
+/// readable on the accent-filled active tab/space background.
+pub(super) fn agent_icon_on_accent(
+    state: AgentState,
+    seen: bool,
+    tick: u32,
+    p: &Palette,
+) -> (&'static str, Style) {
+    let (icon, style) = agent_icon(state, seen, tick, p);
+    let Some(status_color) = style.fg else {
+        return (icon, style);
+    };
+    (
+        icon,
+        style.fg(contrast_adjusted_status_color(status_color, p.accent)),
+    )
+}
+
+fn contrast_adjusted_status_color(status: Color, background: Color) -> Color {
+    let (Some(status_rgb), Some(background_rgb)) = (rgb(status), rgb(background)) else {
+        // ANSI colors are terminal-defined, so changing them via assumed RGB
+        // values could make contrast worse. Preserve those colors as-is.
+        return status;
+    };
+    if contrast_ratio(status_rgb, background_rgb) >= 4.5 {
+        return status;
+    }
+
+    let black = (0, 0, 0);
+    let white = (255, 255, 255);
+    let target = if contrast_ratio(black, background_rgb) >= contrast_ratio(white, background_rgb) {
+        black
+    } else {
+        white
+    };
+
+    for target_weight in (5..=100).step_by(5) {
+        let adjusted = blend_rgb(status_rgb, target, target_weight);
+        if contrast_ratio(adjusted, background_rgb) >= 4.5 {
+            return Color::Rgb(adjusted.0, adjusted.1, adjusted.2);
+        }
+    }
+
+    Color::Rgb(target.0, target.1, target.2)
+}
+
+fn rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
+}
+
+fn blend_rgb(source: (u8, u8, u8), target: (u8, u8, u8), target_weight: u16) -> (u8, u8, u8) {
+    let blend = |source: u8, target: u8| {
+        ((u16::from(source) * (100 - target_weight) + u16::from(target) * target_weight) / 100)
+            as u8
+    };
+    (
+        blend(source.0, target.0),
+        blend(source.1, target.1),
+        blend(source.2, target.2),
+    )
+}
+
+fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+    let a = relative_luminance(a);
+    let b = relative_luminance(b);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let channel = |value: u8| {
+        let value = f64::from(value) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
 pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
         (AgentState::Blocked, _) => "blocked",
@@ -321,5 +404,39 @@ mod tests {
             bottom_center.x,
             area.x + area.width.saturating_sub(bottom_center.width) / 2
         );
+    }
+
+    #[test]
+    fn working_agent_icon_advances_with_spinner_tick() {
+        let palette = Palette::catppuccin();
+        let (first, first_style) = agent_icon(AgentState::Working, false, 0, &palette);
+        let (next, next_style) = agent_icon(AgentState::Working, false, 8, &palette);
+
+        assert_ne!(first, next);
+        assert_eq!(first_style.fg, Some(palette.yellow));
+        assert_eq!(next_style.fg, Some(palette.yellow));
+    }
+
+    #[test]
+    fn active_done_icon_preserves_teal_hue_with_readable_contrast() {
+        let mut palette = Palette::catppuccin();
+        palette.accent = palette.peach;
+
+        let (_, style) = agent_icon_on_accent(AgentState::Idle, false, 0, &palette);
+        let adjusted = style.fg.expect("done icon should have a foreground");
+        let adjusted_rgb = rgb(adjusted).expect("RGB palette should produce an RGB variant");
+        let accent_rgb = rgb(palette.accent).expect("accent should be RGB");
+
+        assert_ne!(adjusted, palette.teal);
+        assert!(adjusted_rgb.1 > adjusted_rgb.2 && adjusted_rgb.2 > adjusted_rgb.0);
+        assert!(contrast_ratio(adjusted_rgb, accent_rgb) >= 4.5);
+    }
+
+    #[test]
+    fn active_status_icon_preserves_terminal_defined_ansi_color() {
+        let palette = Palette::terminal();
+        let (_, style) = agent_icon_on_accent(AgentState::Working, false, 0, &palette);
+
+        assert_eq!(style.fg, Some(palette.yellow));
     }
 }
