@@ -5,11 +5,13 @@
 //! `HeadlessServer`.
 
 use std::collections::VecDeque;
+#[cfg(any(windows, test))]
+use std::io::Read;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SendError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
@@ -36,6 +38,9 @@ const MIN_CLIENT_ROWS: u16 = 1;
 /// within the 5-second deadline, even with OS timer slack, thread scheduling,
 /// and cleanup overhead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+const OBSERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(not(windows))]
+const OBSERVER_READ_POLL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
@@ -53,6 +58,7 @@ pub(crate) struct ClientWriter {
     pub(crate) control: ClientControlWriter,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
     pub(crate) render: ClientRenderWriter,
+    reader_cancelled: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -68,7 +74,18 @@ impl ClientWriter {
             render: ClientRenderWriter {
                 target: ClientRenderTarget::Channel(render),
             },
+            reader_cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+impl ClientWriter {
+    pub(crate) fn cancel_pending_render(&self) {
+        self.render.cancel_pending();
+    }
+
+    pub(crate) fn cancel_reader(&self) {
+        self.reader_cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -182,6 +199,14 @@ impl ClientRenderWriter {
             ClientRenderTarget::Channel(sender) => sender.try_send(data),
         }
     }
+
+    fn cancel_pending(&self) {
+        match &self.target {
+            ClientRenderTarget::Queue(queue) => queue.cancel_render(),
+            #[cfg(test)]
+            ClientRenderTarget::Channel(_) => {}
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -249,6 +274,12 @@ impl ClientWriterQueue {
         Ok(())
     }
 
+    fn cancel_render(&self) {
+        let mut state = self.lock_state();
+        state.render = None;
+        self.ready.notify_one();
+    }
+
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
@@ -295,6 +326,7 @@ pub(crate) enum ServerEvent {
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
+        exact_observe_requested: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -323,6 +355,8 @@ pub(crate) enum ServerEvent {
     },
     /// A client requested read-only observation of one terminal.
     ClientObserveTerminal { client_id: u64, target: String },
+    /// A client requested exact canonical pane observation.
+    ClientObservePane { client_id: u64, pane_id: String },
     /// A client requested writable control of one terminal.
     ClientControlTerminal {
         client_id: u64,
@@ -409,6 +443,34 @@ fn environment_vars_within_limits(vars: &[(String, Option<String>)]) -> bool {
         })
 }
 
+#[cfg(not(windows))]
+fn configure_observer_writes(stream: &LocalStream, client_id: u64) -> io::Result<bool> {
+    match stream.set_send_timeout(Some(OBSERVER_WRITE_TIMEOUT)) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            debug!(client_id, "exact observer socket send timeout unavailable");
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn configure_observer_writes(stream: &LocalStream, client_id: u64) -> io::Result<bool> {
+    match stream.set_send_timeout(Some(OBSERVER_WRITE_TIMEOUT)) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            debug!(
+                client_id,
+                "using nonblocking writes for exact observer named pipe"
+            );
+            stream.set_nonblocking(true)?;
+            Ok(true)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(windows)]
 fn set_client_recv_timeout(
     stream: &LocalStream,
@@ -482,6 +544,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        exact_observe_requested,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -521,8 +584,34 @@ pub(crate) fn handle_client_handshake(
                 }
             };
 
-            // Clamp size.
-            let (clamped_cols, clamped_rows) = clamp_terminal_size(cols, rows);
+            let exact_observe_requested = launch_mode == ClientLaunchMode::TerminalObserve;
+            if exact_observe_requested {
+                let invalid = protocol::validate_observation_dimensions(cols, rows)
+                    .err()
+                    .or_else(|| {
+                        (requested_encoding != RenderEncoding::TerminalAnsi)
+                            .then_some("exact observation requires terminal ANSI encoding")
+                    })
+                    .or_else(|| {
+                        (cell_width_px != 0 || cell_height_px != 0)
+                            .then_some("exact observation does not accept pixel cell dimensions")
+                    });
+                if let Some(error) = invalid {
+                    let welcome = ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::TerminalAnsi,
+                        error: Some(error.to_owned()),
+                    };
+                    let _ = protocol::write_message(&mut stream, &welcome);
+                    return Ok(());
+                }
+            }
+
+            let (clamped_cols, clamped_rows) = if exact_observe_requested {
+                (cols, rows)
+            } else {
+                clamp_terminal_size(cols, rows)
+            };
             (
                 clamped_cols,
                 clamped_rows,
@@ -531,6 +620,7 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
+                exact_observe_requested,
             )
         }
         _ => {
@@ -563,16 +653,26 @@ pub(crate) fn handle_client_handshake(
 
     // Create separate channels for reliable control messages and droppable renders.
     let writer_queue = ClientWriterQueue::new();
+    let reader_cancelled = Arc::new(AtomicBool::new(false));
     let writer = ClientWriter {
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
+        reader_cancelled: reader_cancelled.clone(),
     };
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
     let write_stream = stream.try_clone()?;
+    let retry_nonblocking_observer_writes =
+        exact_observe_requested && configure_observer_writes(&write_stream, client_id)?;
     let writer_event_tx = server_event_tx.clone();
     std::thread::spawn(move || {
-        client_writer_loop(write_stream, client_id, writer_queue, writer_event_tx);
+        client_writer_loop(
+            write_stream,
+            client_id,
+            writer_queue,
+            writer_event_tx,
+            retry_nonblocking_observer_writes,
+        );
     });
 
     // Notify the main loop about the new client.
@@ -585,11 +685,30 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        exact_observe_requested,
         writer,
     });
 
     // Enter read loop — read client messages and forward to main loop.
-    client_read_loop(stream, client_id, server_event_tx, should_quit)
+    if exact_observe_requested {
+        #[cfg(windows)]
+        stream.set_nonblocking(true)?;
+        #[cfg(not(windows))]
+        set_client_recv_timeout(
+            &stream,
+            Some(OBSERVER_READ_POLL_TIMEOUT),
+            "exact observer receive poll timeout unavailable",
+            client_id,
+        )?;
+    }
+    client_read_loop(
+        stream,
+        client_id,
+        server_event_tx,
+        should_quit,
+        exact_observe_requested,
+        &reader_cancelled,
+    )
 }
 
 /// The client writer loop — prioritizes control messages over render frames.
@@ -598,31 +717,56 @@ fn client_writer_loop(
     client_id: u64,
     writer_queue: Arc<ClientWriterQueue>,
     server_event_tx: mpsc::Sender<ServerEvent>,
+    retry_nonblocking_observer_writes: bool,
 ) {
     while let Some(item) = writer_queue.recv() {
         match item {
             ClientWriteItem::Control(data) => {
-                if !write_framed_bytes(&mut stream, &data) {
+                if !write_framed_bytes(&mut stream, &data, retry_nonblocking_observer_writes) {
                     break;
                 }
             }
             ClientWriteItem::Render(data) => {
-                let _ =
-                    server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                if !write_framed_bytes(&mut stream, &data) {
+                if !write_framed_bytes(&mut stream, &data, retry_nonblocking_observer_writes) {
                     break;
                 }
+                let _ =
+                    server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
             }
         }
     }
     writer_queue.close_writer();
+    let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
     debug!("client writer thread exiting");
 }
 
-fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
-    if let Err(err) = stream.write_all(data) {
-        debug!(err = %err, "client write failed, closing writer");
-        return false;
+fn write_framed_bytes(
+    stream: &mut LocalStream,
+    data: &[u8],
+    retry_nonblocking_observer_writes: bool,
+) -> bool {
+    let deadline =
+        retry_nonblocking_observer_writes.then(|| Instant::now() + OBSERVER_WRITE_TIMEOUT);
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        match stream.write(remaining) {
+            Ok(0) => {
+                debug!("client write returned zero bytes, closing writer");
+                return false;
+            }
+            Ok(written) => remaining = &remaining[written..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    && deadline.is_some_and(|deadline| Instant::now() < deadline) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                debug!(err = %err, "client write failed, closing writer");
+                return false;
+            }
+        }
     }
     if let Err(err) = stream.flush() {
         debug!(err = %err, "client flush failed, closing writer");
@@ -637,10 +781,33 @@ fn client_read_loop(
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
+    exact_observe_requested: bool,
+    reader_cancelled: &Arc<AtomicBool>,
 ) -> io::Result<()> {
-    while !should_quit.load(Ordering::Acquire) {
-        let msg: ClientMessage = match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE)
-        {
+    #[cfg(windows)]
+    let mut exact_reader = ExactObserverMessageReader::default();
+    while !should_quit.load(Ordering::Acquire) && !reader_cancelled.load(Ordering::Acquire) {
+        let max_frame_size = if exact_observe_requested {
+            MAX_FRAME_SIZE
+        } else {
+            MAX_GRAPHICS_FRAME_SIZE
+        };
+        #[cfg(not(windows))]
+        let read_result = protocol::read_message(&mut stream, max_frame_size);
+        #[cfg(windows)]
+        let read_result = if exact_observe_requested {
+            match exact_reader.poll(&mut stream) {
+                Ok(Some(message)) => Ok(message),
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            protocol::read_message(&mut stream, max_frame_size)
+        };
+        let msg: ClientMessage = match read_result {
             Ok(msg) => msg,
             Err(protocol::FramingError::UnexpectedEof) => {
                 // Client disconnected.
@@ -658,12 +825,31 @@ fn client_read_loop(
                 break;
             }
             Err(err) => {
+                if exact_observe_requested
+                    && matches!(
+                        &err,
+                        protocol::FramingError::Io(io_err)
+                            if matches!(io_err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+                    )
+                {
+                    continue;
+                }
                 debug!(client_id, err = %err, "client read error, closing");
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
                 break;
             }
         };
+
+        if exact_observe_requested
+            && !matches!(
+                msg,
+                ClientMessage::ObservePane { .. } | ClientMessage::Detach
+            )
+        {
+            debug!(client_id, "discarded message from read-only exact observer");
+            continue;
+        }
 
         let event = match msg {
             ClientMessage::Input { data } => {
@@ -697,6 +883,9 @@ fn client_read_loop(
             }
             ClientMessage::ObserveTerminal { target } => {
                 ServerEvent::ClientObserveTerminal { client_id, target }
+            }
+            ClientMessage::ObservePane { pane_id } => {
+                ServerEvent::ClientObservePane { client_id, pane_id }
             }
             ClientMessage::ControlTerminal { target, takeover } => {
                 ServerEvent::ClientControlTerminal {
@@ -791,6 +980,59 @@ fn client_read_loop(
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct ExactObserverMessageReader {
+    length: [u8; 4],
+    length_read: usize,
+    payload: Vec<u8>,
+    payload_read: usize,
+}
+
+#[cfg(any(windows, test))]
+impl ExactObserverMessageReader {
+    fn poll(
+        &mut self,
+        stream: &mut LocalStream,
+    ) -> Result<Option<ClientMessage>, protocol::FramingError> {
+        if self.length_read < self.length.len() {
+            match stream.read(&mut self.length[self.length_read..]) {
+                Ok(0) => return Err(protocol::FramingError::UnexpectedEof),
+                Ok(read) => self.length_read += read,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(err) => return Err(protocol::FramingError::Io(err)),
+            }
+            if self.length_read < self.length.len() {
+                return Ok(None);
+            }
+            let claimed = u32::from_le_bytes(self.length) as usize;
+            if claimed > MAX_FRAME_SIZE {
+                return Err(protocol::FramingError::Oversized {
+                    claimed,
+                    max: MAX_FRAME_SIZE,
+                });
+            }
+            self.payload = vec![0; claimed];
+        }
+
+        if self.payload_read < self.payload.len() {
+            match stream.read(&mut self.payload[self.payload_read..]) {
+                Ok(0) => return Err(protocol::FramingError::UnexpectedEof),
+                Ok(read) => self.payload_read += read,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(err) => return Err(protocol::FramingError::Io(err)),
+            }
+            if self.payload_read < self.payload.len() {
+                return Ok(None);
+            }
+        }
+
+        let message = protocol::decode_message_payload(&self.payload, MAX_FRAME_SIZE)?;
+        *self = Self::default();
+        Ok(Some(message))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +1079,7 @@ mod tests {
             ClientWriter {
                 control: ClientControlWriter::queue(queue.clone()),
                 render: ClientRenderWriter::queue(queue.clone()),
+                reader_cancelled: Arc::new(AtomicBool::new(false)),
             },
             queue,
         )
@@ -866,6 +1109,27 @@ mod tests {
     }
 
     #[test]
+    fn cancel_pending_render_prevents_frame_after_terminal_close() {
+        let (writer, queue) = test_queue_writer();
+        writer
+            .render
+            .try_send(frame_server_message(&ServerMessage::WindowTitle {
+                title: Some("stale render".into()),
+            }))
+            .expect("queue stale render");
+        writer.cancel_pending_render();
+        let close = frame_server_message(&ServerMessage::ObservationClosed {
+            code: crate::protocol::ObservationCloseCode::PaneUnavailable,
+            reason: "closed".to_owned(),
+        });
+        writer.control.send(close.clone()).expect("queue close");
+
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Control(close)));
+        drop(writer);
+        assert_eq!(queue.recv(), None);
+    }
+
+    #[test]
     fn client_writer_prioritizes_control_and_reports_render_drain() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-writer-priority");
         let (writer, queue) = test_queue_writer();
@@ -882,7 +1146,7 @@ mod tests {
 
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let handle = std::thread::spawn(move || {
-            client_writer_loop(server_stream, 9, queue, server_event_tx);
+            client_writer_loop(server_stream, 9, queue, server_event_tx, false);
         });
 
         match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read control") {
@@ -912,7 +1176,7 @@ mod tests {
         let (server_event_tx, _server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            client_writer_loop(server_stream, 11, queue, server_event_tx);
+            client_writer_loop(server_stream, 11, queue, server_event_tx, false);
             let _ = done_tx.send(());
         });
 
@@ -931,7 +1195,7 @@ mod tests {
         let (server_event_tx, _server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            client_writer_loop(server_stream, 12, queue, server_event_tx);
+            client_writer_loop(server_stream, 12, queue, server_event_tx, false);
             let _ = done_tx.send(());
         });
 
@@ -966,10 +1230,10 @@ mod tests {
             .set_send_timeout(Some(Duration::from_millis(100)))
             .expect("set test send timeout");
         let (writer, queue) = test_queue_writer();
-        let (server_event_tx, _server_event_rx) = mpsc::channel(4);
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            client_writer_loop(server_stream, 13, queue, server_event_tx);
+            client_writer_loop(server_stream, 13, queue, server_event_tx, false);
             let _ = done_tx.send(());
         });
 
@@ -986,6 +1250,12 @@ mod tests {
         assert!(matches!(
             writer.render.try_send(vec![b'z']),
             Err(TrySendError::Disconnected(_))
+        ));
+        assert!(matches!(
+            server_event_rx
+                .blocking_recv()
+                .expect("writer disconnect event"),
+            ServerEvent::ClientDisconnected { client_id: 13 }
         ));
     }
 
@@ -1147,6 +1417,7 @@ new_tab = "ctrl+notakey"
                 render_encoding,
                 keybindings,
                 direct_attach_requested,
+                exact_observe_requested,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1155,6 +1426,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
+                assert!(!exact_observe_requested);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1233,13 +1505,242 @@ new_tab = "ctrl+notakey"
     }
 
     #[test]
+    fn handshake_negotiates_exact_observer_with_strict_dimensions() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-handshake-exact-observer");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(8);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+        });
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: 120,
+                rows: 40,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalObserve,
+            },
+        )
+        .expect("write exact observer hello");
+        assert!(matches!(
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("welcome"),
+            ServerMessage::Welcome { error: None, .. }
+        ));
+        let writer = match server_event_rx.blocking_recv().expect("connected event") {
+            ServerEvent::ClientConnected {
+                direct_attach_requested,
+                exact_observe_requested,
+                writer,
+                ..
+            } => {
+                assert!(!direct_attach_requested);
+                assert!(exact_observe_requested);
+                writer
+            }
+            other => panic!("expected connected event, got {other:?}"),
+        };
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::ObservePane {
+                pane_id: "w_live:p1".to_owned(),
+            },
+        )
+        .expect("write exact observe request");
+        assert!(matches!(
+            server_event_rx.blocking_recv().expect("observe event"),
+            ServerEvent::ClientObservePane { client_id: 42, pane_id }
+                if pane_id == "w_live:p1"
+        ));
+
+        drop(writer);
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle.join().expect("handshake thread").expect("handshake");
+    }
+
+    #[test]
+    fn handshake_rejects_oversized_exact_observer_dimensions_before_connect() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-handshake-exact-observer-oversized");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(2);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 42, &server_event_tx, &should_quit)
+        });
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: protocol::MAX_OBSERVATION_COLS,
+                rows: protocol::MAX_OBSERVATION_ROWS,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalObserve,
+            },
+        )
+        .expect("write oversized observer hello");
+        match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("rejection") {
+            ServerMessage::Welcome {
+                error: Some(error), ..
+            } => {
+                assert!(error.contains("total-cell"));
+            }
+            other => panic!("expected rejected welcome, got {other:?}"),
+        }
+        assert!(server_event_rx.try_recv().is_err());
+        handle.join().expect("handshake thread").expect("handshake");
+    }
+
+    #[test]
+    fn exact_observer_wire_discards_mutation_and_uses_normal_frame_cap() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-exact-observer");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let reader_cancelled = Arc::new(AtomicBool::new(false));
+        let read_cancelled = reader_cancelled.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                true,
+                &read_cancelled,
+            )
+        });
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Input {
+                data: b"discarded".to_vec(),
+            },
+        )
+        .expect("write discarded mutation");
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::ObservePane {
+                pane_id: "w_live:p1".to_owned(),
+            },
+        )
+        .expect("write observe request");
+        assert!(matches!(
+            server_event_rx.blocking_recv().expect("observe event"),
+            ServerEvent::ClientObservePane { client_id: 7, .. }
+        ));
+        assert!(server_event_rx.try_recv().is_err());
+
+        client_stream
+            .write_all(&((MAX_FRAME_SIZE + 1) as u32).to_le_bytes())
+            .expect("write oversized length");
+        assert!(matches!(
+            server_event_rx.blocking_recv().expect("disconnect event"),
+            ServerEvent::ClientDisconnected { client_id: 7 }
+        ));
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle.join().expect("read thread").expect("read loop");
+    }
+
+    #[test]
+    fn exact_observer_incremental_reader_preserves_fragmented_frames() {
+        let (mut client_stream, mut server_stream, _path) =
+            local_stream_pair("exact-observer-fragmented-frame");
+        server_stream
+            .set_nonblocking(true)
+            .expect("set polling mode");
+        let message = ClientMessage::ObservePane {
+            pane_id: "w1:p1".to_owned(),
+        };
+        let mut framed = Vec::new();
+        protocol::write_message(&mut framed, &message).expect("frame message");
+        let mut reader = ExactObserverMessageReader::default();
+
+        client_stream
+            .write_all(&framed[..2])
+            .expect("write partial prefix");
+        assert!(reader
+            .poll(&mut server_stream)
+            .expect("poll prefix")
+            .is_none());
+        client_stream
+            .write_all(&framed[2..7])
+            .expect("write prefix and partial payload");
+        assert!(reader
+            .poll(&mut server_stream)
+            .expect("poll payload")
+            .is_none());
+        client_stream
+            .write_all(&framed[7..])
+            .expect("write remaining payload");
+        assert_eq!(
+            reader.poll(&mut server_stream).expect("complete frame"),
+            Some(message)
+        );
+    }
+
+    #[test]
+    fn cancelled_exact_observer_reader_exits_while_peer_stays_open() {
+        let (_client_stream, server_stream, _path) =
+            local_stream_pair("exact-observer-reader-cancel");
+        #[cfg(not(windows))]
+        server_stream
+            .set_recv_timeout(Some(Duration::from_millis(20)))
+            .expect("set receive polling timeout");
+        #[cfg(windows)]
+        server_stream
+            .set_nonblocking(true)
+            .expect("set named pipe polling mode");
+        let (server_event_tx, _server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let reader_cancelled = Arc::new(AtomicBool::new(false));
+        let read_cancelled = reader_cancelled.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = client_read_loop(
+                server_stream,
+                17,
+                &server_event_tx,
+                &should_quit,
+                true,
+                &read_cancelled,
+            );
+            let _ = done_tx.send(result);
+        });
+
+        reader_cancelled.store(true, Ordering::Release);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled reader exits")
+            .expect("reader exits cleanly");
+    }
+
+    #[test]
     fn client_read_loop_rejects_oversized_input() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-read-oversized");
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
+        let reader_cancelled = Arc::new(AtomicBool::new(false));
+        let read_cancelled = reader_cancelled.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                false,
+                &read_cancelled,
+            )
         });
 
         protocol::write_message(
@@ -1272,8 +1773,17 @@ new_tab = "ctrl+notakey"
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
+        let reader_cancelled = Arc::new(AtomicBool::new(false));
+        let read_cancelled = reader_cancelled.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                false,
+                &read_cancelled,
+            )
         });
         let events = vec![
             ClientInputEvent::Key {
@@ -1321,8 +1831,17 @@ new_tab = "ctrl+notakey"
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
+        let reader_cancelled = Arc::new(AtomicBool::new(false));
+        let read_cancelled = reader_cancelled.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                false,
+                &read_cancelled,
+            )
         });
 
         protocol::write_message(
@@ -1356,8 +1875,17 @@ new_tab = "ctrl+notakey"
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let should_quit = Arc::new(AtomicBool::new(false));
         let read_quit = should_quit.clone();
+        let reader_cancelled = Arc::new(AtomicBool::new(false));
+        let read_cancelled = reader_cancelled.clone();
         let handle = std::thread::spawn(move || {
-            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+            client_read_loop(
+                server_stream,
+                7,
+                &server_event_tx,
+                &read_quit,
+                false,
+                &read_cancelled,
+            )
         });
 
         protocol::write_message(

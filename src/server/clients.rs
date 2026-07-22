@@ -8,8 +8,18 @@ use crate::server::render_stream::ClientRenderState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClientConnectionMode {
     App,
-    TerminalAttach { terminal_id: String },
-    TerminalObserve { terminal_id: String },
+    TerminalAttach {
+        terminal_id: String,
+    },
+    TerminalObserve {
+        terminal_id: String,
+    },
+    ExactPaneObserve {
+        pane_id: crate::layout::PaneId,
+        canonical_pane_id: String,
+        terminal_id: String,
+        terminal_generation: crate::terminal::TerminalRuntimeGeneration,
+    },
 }
 
 pub(crate) type RenderTarget = (
@@ -34,6 +44,8 @@ pub(crate) struct ClientConnection {
     pub(crate) mode: ClientConnectionMode,
     /// True after the handshake for clients that will switch into direct terminal attach mode.
     pub(crate) pending_terminal_attach: bool,
+    /// True only for the dedicated exact read-only observation handshake.
+    pub(crate) pending_exact_observe: bool,
     /// Client-local app keybindings. None means use the server's keybindings.
     pub(crate) keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
     /// The client's terminal size after clamping.
@@ -60,6 +72,8 @@ pub(crate) struct ClientConnection {
     pub(crate) graphics_surface_reset_pending: bool,
     /// Whether an ordinary render was skipped because the render channel was full.
     pub(crate) render_pending: bool,
+    /// True while an exact observer frame is queued or blocked in socket I/O.
+    pub(crate) render_lane_occupied: bool,
     /// Whether a pane-graphics-only render was skipped because the channel was full.
     pane_graphics_render_pending: bool,
     /// Last host mouse capture mode sent to this client.
@@ -91,6 +105,7 @@ impl ClientConnection {
             last_activity,
             render_encoding,
             false,
+            false,
             writer,
         )
     }
@@ -105,11 +120,13 @@ impl ClientConnection {
         last_activity: u64,
         render_encoding: RenderEncoding,
         pending_terminal_attach: bool,
+        pending_exact_observe: bool,
         writer: Option<ClientWriter>,
     ) -> Self {
         Self {
             mode,
             pending_terminal_attach,
+            pending_exact_observe,
             keybindings,
             terminal_size,
             cell_size,
@@ -125,6 +142,7 @@ impl ClientConnection {
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             graphics_surface_reset_pending: false,
             render_pending: false,
+            render_lane_occupied: false,
             pane_graphics_render_pending: false,
             host_mouse_capture_active: None,
             staged_clipboard_files: Vec::new(),
@@ -171,7 +189,17 @@ impl ClientConnection {
     }
 
     pub(crate) fn is_full_app_client(&self) -> bool {
-        matches!(self.mode, ClientConnectionMode::App) && !self.pending_terminal_attach
+        matches!(self.mode, ClientConnectionMode::App)
+            && !self.pending_terminal_attach
+            && !self.pending_exact_observe
+    }
+
+    pub(crate) fn is_exact_observer(&self) -> bool {
+        matches!(self.mode, ClientConnectionMode::ExactPaneObserve { .. })
+    }
+
+    pub(crate) fn is_exact_observation_connection(&self) -> bool {
+        self.pending_exact_observe || self.is_exact_observer()
     }
 
     pub(crate) fn request_semantic_redraw_after_input(&mut self) {
@@ -277,6 +305,10 @@ pub(crate) fn terminal_stream_client_ids(
             }
             | ClientConnectionMode::TerminalObserve {
                 terminal_id: attached,
+            }
+            | ClientConnectionMode::ExactPaneObserve {
+                terminal_id: attached,
+                ..
             } if attached == terminal_id => Some(client_id),
             _ => None,
         })
@@ -296,6 +328,7 @@ pub(crate) fn render_targets(
                         client.mode,
                         ClientConnectionMode::TerminalAttach { .. }
                             | ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::ExactPaneObserve { .. }
                     ))
         })
         .map(|(&client_id, client)| {

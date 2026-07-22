@@ -67,6 +67,9 @@ pub fn start_server(
         Some(ServerCapabilities {
             live_handoff: crate::platform::capabilities().live_handoff,
             detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+            terminal_observation: Some(
+                crate::api::schema::TerminalObservationCapabilities::current(),
+            ),
         }),
     )
 }
@@ -993,6 +996,9 @@ mod tests {
             Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                terminal_observation: Some(
+                    crate::api::schema::TerminalObservationCapabilities::current(),
+                ),
             }),
             None,
         );

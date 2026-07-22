@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 16,
+  "protocol": 17,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -9044,6 +9044,16 @@
             },
             "live_handoff": {
               "type": "boolean"
+            },
+            "terminal_observation": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/TerminalObservationCapabilities"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -9164,6 +9174,79 @@
             "focused",
             "pane_count",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "TerminalObservationCapabilities": {
+          "properties": {
+            "bounded_frames": {
+              "type": "boolean"
+            },
+            "coalesced_updates": {
+              "type": "boolean"
+            },
+            "exact_pane": {
+              "type": "boolean"
+            },
+            "full_frame_first": {
+              "type": "boolean"
+            },
+            "max_ansi_bytes": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_cells": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_frame_bytes": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_record_bytes": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pty_survives_disconnect": {
+              "type": "boolean"
+            },
+            "read_only": {
+              "type": "boolean"
+            },
+            "view_only_dimensions": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "exact_pane",
+            "read_only",
+            "view_only_dimensions",
+            "full_frame_first",
+            "bounded_frames",
+            "coalesced_updates",
+            "pty_survives_disconnect",
+            "max_cols",
+            "max_rows",
+            "max_cells",
+            "max_frame_bytes",
+            "max_ansi_bytes",
+            "max_record_bytes"
           ],
           "type": "object"
         },

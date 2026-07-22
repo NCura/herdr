@@ -28,6 +28,8 @@ mod worktree;
 
 const TERMINAL_SESSION_OBSERVE_USAGE: &str =
     "usage: herdr terminal session observe <target> [--cols N] [--rows N]";
+const TERMINAL_SESSION_OBSERVE_PANE_USAGE: &str =
+    "usage: herdr terminal session observe-pane <pane_id> [--cols N] [--rows N]";
 const TERMINAL_SESSION_CONTROL_USAGE: &str =
     "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N]";
 
@@ -530,14 +532,17 @@ fn terminal_session(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("control") => terminal_session_control(&args[1..]),
         Some("observe") => terminal_session_observe(&args[1..]),
+        Some("observe-pane") => terminal_session_observe_pane(&args[1..]),
         Some("help" | "--help" | "-h") => {
             eprintln!("{TERMINAL_SESSION_CONTROL_USAGE}");
             eprintln!("{TERMINAL_SESSION_OBSERVE_USAGE}");
+            eprintln!("{TERMINAL_SESSION_OBSERVE_PANE_USAGE}");
             Ok(0)
         }
         _ => {
             eprintln!("{TERMINAL_SESSION_CONTROL_USAGE}");
             eprintln!("{TERMINAL_SESSION_OBSERVE_USAGE}");
+            eprintln!("{TERMINAL_SESSION_OBSERVE_PANE_USAGE}");
             Ok(2)
         }
     }
@@ -574,8 +579,33 @@ fn terminal_session_observe(args: &[String]) -> std::io::Result<i32> {
         Err(code) => return Ok(code),
     };
 
+    validate_observation_dimensions(options.cols, options.rows)?;
+
     crate::client::run_terminal_session_observe(options.target, options.cols, options.rows)?;
     Ok(0)
+}
+
+fn terminal_session_observe_pane(args: &[String]) -> std::io::Result<i32> {
+    let options = match parse_terminal_session_options(
+        args,
+        TERMINAL_SESSION_OBSERVE_PANE_USAGE,
+        "observe-pane",
+        false,
+    )? {
+        Ok(options) => options,
+        Err(code) => return Ok(code),
+    };
+    validate_observation_dimensions(options.cols, options.rows)?;
+    crate::protocol::validate_observation_pane_id(&options.target)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+
+    crate::client::run_terminal_session_observe_pane(options.target, options.cols, options.rows)?;
+    Ok(0)
+}
+
+fn validate_observation_dimensions(cols: u16, rows: u16) -> std::io::Result<()> {
+    crate::protocol::validate_observation_dimensions(cols, rows)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))
 }
 
 struct TerminalSessionOptions {
@@ -1198,6 +1228,7 @@ fn print_terminal_help() {
     eprintln!("  herdr terminal attach <terminal_id> [--takeover]");
     eprintln!("  herdr terminal session control <target> [--takeover] [--cols N] [--rows N]");
     eprintln!("  herdr terminal session observe <target> [--cols N] [--rows N]");
+    eprintln!("  herdr terminal session observe-pane <pane_id> [--cols N] [--rows N]");
     eprintln!("  herdr terminal title set <title>");
     eprintln!("  herdr terminal title clear");
     eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");

@@ -281,6 +281,7 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 herdr terminal attach <terminal_id> [--takeover]
 herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
+herdr terminal session observe-pane <pane_id> [--cols N] [--rows N]
 herdr terminal title set <title>
 herdr terminal title clear
 ```
@@ -297,6 +298,23 @@ terminal, or agent target. It prints newline-delimited JSON `terminal.frame`
 records with base64-encoded ANSI bytes, then a `terminal.closed` record when
 the server closes the stream. Multiple observers can watch the same terminal
 without taking input, resize, scroll, or takeover authority.
+
+`terminal session observe-pane` is the strict integration path. It accepts only
+the current canonical pane ID returned by Herdr, with no terminal ID, agent
+label, alias, stale-ID, or current-pane fallback. The observer is bound to that
+pane, terminal ID, and terminal runtime generation and closes if any identity
+changes. Its dimensions affect only the rendered view and never resize the PTY.
+Dimensions are limited to 240 columns, 120 rows, and 20,000 total cells; the
+default is 120x40. The first `terminal.frame` is full with sequence 1, later
+frames are contiguous and coalesced when the writer is blocked. Binary wire
+frames and encoded NDJSON records are each limited to 2 MB; ANSI payloads use
+the lower advertised `max_ansi_bytes` limit so base64 and JSON framing fit.
+`terminal.closed`
+includes one of `invalid_request`, `pane_unavailable`, `pane_changed`,
+`frame_too_large`, `protocol_error`, or `detached`. Disconnecting an observer
+does not send input, resize or scroll the PTY, change controller ownership, or
+stop the PTY process. Check `capabilities.terminal_observation` in `ping` or
+`herdr status server --json` before using this contract.
 `terminal title clear` restores Herdr's default outer terminal window title.
 
 ## Waits

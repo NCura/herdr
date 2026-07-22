@@ -43,8 +43,8 @@ use crate::ipc::{
     SocketFileIdentity,
 };
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE,
+    self, AttachScrollDirection, AttachScrollSource, FrameData, ObservationCloseCode,
+    ServerMessage, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, MAX_OBSERVATION_ANSI_BYTES,
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
@@ -116,6 +116,45 @@ fn notification_show_response_shown(response: &str) -> bool {
 
 fn non_empty_body(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn truncate_observation_reason(reason: &str) -> String {
+    let max = protocol::MAX_OBSERVATION_REASON_BYTES;
+    if reason.len() <= max {
+        return reason.to_owned();
+    }
+    let mut end = max;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
+}
+
+fn exact_observer_mutating_event_client(event: &ServerEvent) -> Option<u64> {
+    match event {
+        ServerEvent::ClientInput { client_id, .. }
+        | ServerEvent::ClientInputEvents { client_id, .. }
+        | ServerEvent::ClientClipboardImage { client_id, .. }
+        | ServerEvent::ClientUpdateEnvironment { client_id, .. }
+        | ServerEvent::ClientAttachTerminal { client_id, .. }
+        | ServerEvent::ClientObserveTerminal { client_id, .. }
+        | ServerEvent::ClientObservePane { client_id, .. }
+        | ServerEvent::ClientControlTerminal { client_id, .. }
+        | ServerEvent::ClientAttachScroll { client_id, .. }
+        | ServerEvent::ClientResize { client_id, .. } => Some(*client_id),
+        ServerEvent::ClientConnected { .. }
+        | ServerEvent::ClientDetach { .. }
+        | ServerEvent::ClientDisconnected { .. }
+        | ServerEvent::ClientWriterDrained { .. }
+        | ServerEvent::QuitSignal => None,
+    }
+}
+
+fn exact_observation_message_exceeds_limit(message: &ServerMessage) -> bool {
+    matches!(
+        message,
+        ServerMessage::Terminal(frame) if frame.bytes.len() > MAX_OBSERVATION_ANSI_BYTES
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,6 +1436,14 @@ impl HeadlessServer {
 
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
+        if let Some(client) = self.clients.get(&client_id) {
+            if client.is_exact_observation_connection() {
+                if let Some(writer) = &client.writer {
+                    writer.cancel_pending_render();
+                    writer.cancel_reader();
+                }
+            }
+        }
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
@@ -1659,6 +1706,23 @@ impl HeadlessServer {
     }
 
     fn observe_terminal_client(&mut self, client_id: u64, target: String) -> bool {
+        let dimensions_valid = self.clients.get(&client_id).is_some_and(|client| {
+            protocol::validate_observation_dimensions(
+                client.terminal_size.0,
+                client.terminal_size.1,
+            )
+            .is_ok()
+        });
+        if !dimensions_valid {
+            self.send_to_client(
+                client_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some("terminal session observe failed: invalid dimensions".to_owned()),
+                },
+            );
+            self.remove_client_and_resize_if_needed(client_id);
+            return false;
+        }
         let Some(terminal_id) = self.resolve_terminal_session_target(client_id, &target, "observe")
         else {
             return false;
@@ -1682,6 +1746,102 @@ impl HeadlessServer {
 
         info!(client_id, cols, rows, terminal_id = %terminal_id, "terminal observe client connected");
         true
+    }
+
+    fn observe_exact_pane_client(&mut self, client_id: u64, pane_id: String) -> bool {
+        let pending = self.clients.get(&client_id).is_some_and(|client| {
+            client.pending_exact_observe
+                && matches!(client.mode, ClientConnectionMode::App)
+                && protocol::validate_observation_dimensions(
+                    client.terminal_size.0,
+                    client.terminal_size.1,
+                )
+                .is_ok()
+        });
+        if !pending {
+            self.close_exact_observer(
+                client_id,
+                ObservationCloseCode::InvalidRequest,
+                "exact pane observation was not negotiated or has invalid dimensions",
+            );
+            return false;
+        }
+        if let Err(reason) = protocol::validate_observation_pane_id(&pane_id) {
+            self.close_exact_observer(client_id, ObservationCloseCode::InvalidRequest, reason);
+            return false;
+        }
+        let Some(target) = self.app.resolve_exact_pane_target(&pane_id) else {
+            self.close_exact_observer(
+                client_id,
+                ObservationCloseCode::PaneUnavailable,
+                "canonical pane is not currently available",
+            );
+            return false;
+        };
+        let Some(runtime) = self.app.terminal_runtimes.get(&target.terminal_id) else {
+            self.close_exact_observer(
+                client_id,
+                ObservationCloseCode::PaneUnavailable,
+                "canonical pane has no current terminal runtime",
+            );
+            return false;
+        };
+        let terminal_generation = runtime.generation();
+        let terminal_id = target.terminal_id.to_string();
+        let stamp = self.allocate_activity_stamp();
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.mode = ClientConnectionMode::ExactPaneObserve {
+            pane_id: target.pane_id,
+            canonical_pane_id: target.canonical_pane_id,
+            terminal_id: terminal_id.clone(),
+            terminal_generation,
+        };
+        client.pending_terminal_attach = false;
+        client.pending_exact_observe = false;
+        client.render_state.reset_baseline();
+        client.last_activity = stamp;
+        info!(
+            client_id,
+            pane_id, terminal_id, "exact pane observer connected"
+        );
+        true
+    }
+
+    fn close_exact_observer(&mut self, client_id: u64, code: ObservationCloseCode, reason: &str) {
+        let reason = truncate_observation_reason(reason);
+        if let Some(writer) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.writer.as_ref())
+        {
+            writer.cancel_pending_render();
+        }
+        self.send_to_client(client_id, ServerMessage::ObservationClosed { code, reason });
+        self.remove_client_and_resize_if_needed(client_id);
+    }
+
+    fn exact_observer_binding_is_current(&self, client_id: u64) -> bool {
+        let Some(ClientConnection {
+            mode:
+                ClientConnectionMode::ExactPaneObserve {
+                    pane_id,
+                    canonical_pane_id,
+                    terminal_id,
+                    terminal_generation,
+                },
+            ..
+        }) = self.clients.get(&client_id)
+        else {
+            return false;
+        };
+        self.app.exact_pane_binding_is_current(
+            *pane_id,
+            canonical_pane_id,
+            terminal_id,
+            terminal_generation,
+        )
     }
 
     fn control_terminal_client(&mut self, client_id: u64, target: String, takeover: bool) -> bool {
@@ -2367,6 +2527,9 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
+            if matches!(msg, ServerMessage::ReloadSoundConfig) && !client.is_full_app_client() {
+                continue;
+            }
             if let Some(writer) = &client.writer {
                 if writer.control.send(serialized.clone()).is_err() {
                     debug!(client_id, "client writer channel closed during broadcast");
@@ -2421,17 +2584,51 @@ impl HeadlessServer {
         let client_ids = terminal_stream_client_ids(&self.clients, terminal_id);
 
         for client_id in client_ids {
-            self.send_to_client(
-                client_id,
-                ServerMessage::ServerShutdown {
-                    reason: Some(reason.clone()),
-                },
-            );
+            if self
+                .clients
+                .get(&client_id)
+                .is_some_and(ClientConnection::is_exact_observer)
+            {
+                self.close_exact_observer(
+                    client_id,
+                    ObservationCloseCode::PaneUnavailable,
+                    &reason,
+                );
+                continue;
+            } else {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::ServerShutdown {
+                        reason: Some(reason.clone()),
+                    },
+                );
+            }
             self.remove_client_and_resize_if_needed(client_id);
         }
     }
 
     fn send_terminal_stream_detach_shutdown(&mut self, client_id: u64) {
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(ClientConnection::is_exact_observer)
+        {
+            if let Some(writer) = self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.writer.as_ref())
+            {
+                writer.cancel_pending_render();
+            }
+            self.send_to_client(
+                client_id,
+                ServerMessage::ObservationClosed {
+                    code: ObservationCloseCode::Detached,
+                    reason: "detached".to_owned(),
+                },
+            );
+            return;
+        }
         if matches!(
             self.clients.get(&client_id).map(|client| &client.mode),
             Some(
@@ -2461,9 +2658,6 @@ impl HeadlessServer {
                     ),
                 },
             );
-            if let Some(client) = self.clients.get_mut(&client_id) {
-                client.writer = None;
-            }
             let _ = self.remove_client(client_id);
         }
         self.foreground_client_id = None;
@@ -2641,6 +2835,17 @@ impl HeadlessServer {
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
             return false;
         }
+        if let Some(client_id) = exact_observer_mutating_event_client(&ev) {
+            let blocked = self.clients.get(&client_id).is_some_and(|client| {
+                client.is_exact_observation_connection()
+                    && !(client.pending_exact_observe
+                        && matches!(ev, ServerEvent::ClientObservePane { .. }))
+            });
+            if blocked {
+                debug!(client_id, "discarded mutating event from exact observer");
+                return false;
+            }
+        }
 
         match ev {
             ServerEvent::ClientConnected {
@@ -2653,6 +2858,7 @@ impl HeadlessServer {
                 writer,
                 render_encoding,
                 direct_attach_requested,
+                exact_observe_requested,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2667,7 +2873,22 @@ impl HeadlessServer {
                     }
                     return false;
                 }
-                let first_app_client = !direct_attach_requested && self.app_client_count() == 0;
+                if exact_observe_requested
+                    && protocol::validate_observation_dimensions(cols, rows).is_err()
+                {
+                    if let Ok(message) =
+                        Self::frame_server_message(&ServerMessage::ObservationClosed {
+                            code: ObservationCloseCode::InvalidRequest,
+                            reason: "invalid exact observation dimensions".to_owned(),
+                        })
+                    {
+                        let _ = writer.control.send(message);
+                    }
+                    return false;
+                }
+                let first_app_client = !direct_attach_requested
+                    && !exact_observe_requested
+                    && self.app_client_count() == 0;
                 info!(
                     client_id,
                     cols,
@@ -2693,18 +2914,21 @@ impl HeadlessServer {
                         last_activity,
                         render_encoding,
                         direct_attach_requested,
+                        exact_observe_requested,
                         Some(writer),
                     ),
                 );
-                if !direct_attach_requested {
+                if !direct_attach_requested && !exact_observe_requested {
                     self.foreground_client_id = Some(client_id);
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
-                self.sync_foreground_client_state();
-                self.resize_shared_runtime_to_effective_size();
-                self.nudge_handoff_panes_on_first_client_attach();
+                if !exact_observe_requested {
+                    self.sync_foreground_client_state();
+                    self.resize_shared_runtime_to_effective_size();
+                    self.nudge_handoff_panes_on_first_client_attach();
+                }
                 true
             }
             ServerEvent::ClientAttachTerminal {
@@ -2714,6 +2938,9 @@ impl HeadlessServer {
             } => self.attach_terminal_client(client_id, terminal_id, takeover),
             ServerEvent::ClientObserveTerminal { client_id, target } => {
                 self.observe_terminal_client(client_id, target)
+            }
+            ServerEvent::ClientObservePane { client_id, pane_id } => {
+                self.observe_exact_pane_client(client_id, pane_id)
             }
             ServerEvent::ClientControlTerminal {
                 client_id,
@@ -2914,6 +3141,7 @@ impl HeadlessServer {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return false;
                 };
+                client.render_lane_occupied = false;
                 client.take_deferred_render() != DeferredRender::None
             }
             ServerEvent::QuitSignal => {
@@ -3591,6 +3819,28 @@ impl HeadlessServer {
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
+            let is_exact_observer = matches!(mode, ClientConnectionMode::ExactPaneObserve { .. });
+            if is_exact_observer
+                && self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.render_lane_occupied)
+            {
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.defer_full_render();
+                }
+                deferred_frame = true;
+                crate::render_prof::event("full_render.exact_observer_lane_occupied");
+                continue;
+            }
+            if is_exact_observer && !self.exact_observer_binding_is_current(client_id) {
+                self.close_exact_observer(
+                    client_id,
+                    ObservationCloseCode::PaneChanged,
+                    "canonical pane no longer refers to the observed terminal runtime",
+                );
+                continue;
+            }
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
@@ -3633,7 +3883,8 @@ impl HeadlessServer {
                     frame
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
-                | ClientConnectionMode::TerminalObserve { terminal_id } => {
+                | ClientConnectionMode::TerminalObserve { terminal_id }
+                | ClientConnectionMode::ExactPaneObserve { terminal_id, .. } => {
                     let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
                         self.send_to_client(
                             client_id,
@@ -3698,6 +3949,17 @@ impl HeadlessServer {
                 continue;
             };
 
+            if is_exact_observer && client.render_state.terminal_sequence_exhausted() {
+                if let Ok(message) = Self::frame_server_message(&ServerMessage::ObservationClosed {
+                    code: ObservationCloseCode::ProtocolError,
+                    reason: "observation frame sequence exhausted".to_owned(),
+                }) {
+                    let _ = writer.control.send(message);
+                }
+                broken_clients.push(client_id);
+                continue;
+            }
+
             let mut commit_graphics_cache = true;
             if frame.graphics.len() > MAX_GRAPHICS_FRAME_SIZE {
                 warn!(
@@ -3724,6 +3986,21 @@ impl HeadlessServer {
                 continue;
             };
             crate::render_prof::duration_since("full_render.prepare_frame", prepare_started);
+
+            if is_exact_observer && exact_observation_message_exceeds_limit(prepared.message()) {
+                warn!(
+                    client_id,
+                    "closing exact observer after oversized terminal frame"
+                );
+                if let Ok(message) = Self::frame_server_message(&ServerMessage::ObservationClosed {
+                    code: ObservationCloseCode::FrameTooLarge,
+                    reason: "required observation frame exceeds the public record limit".to_owned(),
+                }) {
+                    let _ = writer.control.send(message);
+                }
+                broken_clients.push(client_id);
+                continue;
+            }
 
             let serialize_started = crate::render_prof::timer();
             let serialized = match Self::frame_server_message_with_max(
@@ -3782,6 +4059,19 @@ impl HeadlessServer {
                         client_id,
                         claimed, max, "skipping oversized frame for client"
                     );
+                    if is_exact_observer {
+                        if let Ok(message) =
+                            Self::frame_server_message(&ServerMessage::ObservationClosed {
+                                code: ObservationCloseCode::FrameTooLarge,
+                                reason:
+                                    "required observation frame exceeds the terminal frame limit"
+                                        .to_owned(),
+                            })
+                        {
+                            let _ = writer.control.send(message);
+                        }
+                        broken_clients.push(client_id);
+                    }
                     crate::render_prof::event("full_render.serialize_oversized");
                     crate::render_prof::duration_since("full_render.serialize", serialize_started);
                     continue;
@@ -3805,6 +4095,9 @@ impl HeadlessServer {
                         client.graphics_surface_reset_pending = false;
                     }
                     client.render_state.commit_sent_frame(prepared);
+                    if is_exact_observer {
+                        client.render_lane_occupied = true;
+                    }
                     crate::render_prof::event("full_render.sent");
                     crate::render_prof::duration_since("full_render.try_send", send_started);
                 }
@@ -4825,6 +5118,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer: writer_a,
         }));
         assert_eq!(
@@ -4849,6 +5143,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -4889,6 +5184,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -4902,6 +5198,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -4945,6 +5242,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -5020,6 +5318,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -5040,6 +5339,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer: writer_b,
         }));
         assert_eq!(
@@ -5074,6 +5374,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            exact_observe_requested: false,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -5139,9 +5440,591 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            exact_observe_requested: false,
             writer,
         }));
         control_rx
+    }
+
+    fn connect_pending_exact_observer(
+        server: &mut HeadlessServer,
+        client_id: u64,
+    ) -> (
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (writer, control_rx, render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id,
+            cols: 120,
+            rows: 40,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: false,
+            exact_observe_requested: true,
+            writer,
+        }));
+        (control_rx, render_rx)
+    }
+
+    fn read_observation_close(bytes: Vec<u8>) -> (ObservationCloseCode, String) {
+        match read_server_message(bytes) {
+            ServerMessage::ObservationClosed { code, reason } => (code, reason),
+            other => panic!("expected observation close, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_rejects_oversized_exact_observation_initial_and_incremental_messages() {
+        for (seq, full) in [(1, true), (2, false)] {
+            let message = ServerMessage::Terminal(crate::protocol::TerminalFrame {
+                seq,
+                width: 120,
+                height: 40,
+                full,
+                bytes: vec![0; MAX_OBSERVATION_ANSI_BYTES + 1],
+            });
+            assert!(exact_observation_message_exceeds_limit(&message));
+        }
+        assert!(!exact_observation_message_exceeds_limit(
+            &ServerMessage::Terminal(crate::protocol::TerminalFrame {
+                seq: 1,
+                width: 120,
+                height: 40,
+                full: true,
+                bytes: vec![0; MAX_OBSERVATION_ANSI_BYTES],
+            })
+        ));
+    }
+
+    #[test]
+    fn server_rejects_invalid_exact_observer_dimensions_before_tracking_client() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: protocol::MAX_OBSERVATION_COLS,
+            rows: protocol::MAX_OBSERVATION_ROWS,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: false,
+            exact_observe_requested: true,
+            writer,
+        }));
+        assert!(!server.clients.contains_key(&7));
+        let (code, _) = read_observation_close(control_rx.recv().expect("typed rejection"));
+        assert_eq!(code, ObservationCloseCode::InvalidRequest);
+    }
+
+    #[test]
+    fn exact_pane_observer_rejects_invalid_id_with_typed_close() {
+        let mut server = test_headless_server();
+        let (control_rx, _render_rx) = connect_pending_exact_observer(&mut server, 7);
+
+        assert!(!server.handle_server_event(ServerEvent::ClientObservePane {
+            client_id: 7,
+            pane_id: "p".repeat(protocol::MAX_OBSERVATION_PANE_ID_BYTES + 1),
+        }));
+
+        let (code, reason) = read_observation_close(control_rx.recv().expect("typed close"));
+        assert_eq!(code, ObservationCloseCode::InvalidRequest);
+        assert!(reason.contains("byte limit"));
+        assert!(!server.clients.contains_key(&7));
+    }
+
+    #[test]
+    fn exact_observer_does_not_receive_app_control_broadcasts() {
+        let mut server = test_headless_server();
+        let (control_rx, _render_rx) = connect_pending_exact_observer(&mut server, 7);
+
+        server.send_to_all_clients(ServerMessage::ReloadSoundConfig);
+
+        assert!(control_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn exact_pane_observer_resolves_only_current_canonical_namespace() {
+        with_terminal_session_test_server(
+            |server, terminal_id, terminal_id_string, public_pane_id| {
+                let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+                assert!(server
+                    .app
+                    .resolve_exact_pane_target(&public_pane_id)
+                    .is_some());
+                assert!(server
+                    .app
+                    .resolve_exact_pane_target(&terminal_id_string)
+                    .is_none());
+                assert!(server.app.resolve_exact_pane_target("current").is_none());
+                assert!(server.app.resolve_exact_pane_target("").is_none());
+                assert!(server
+                    .app
+                    .resolve_exact_pane_target("stale-workspace:p999")
+                    .is_none());
+
+                server
+                    .app
+                    .state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .expect("terminal")
+                    .agent_name = Some("named-agent".to_owned());
+                assert!(server
+                    .app
+                    .resolve_exact_pane_target("named-agent")
+                    .is_none());
+                server
+                    .app
+                    .state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .expect("terminal")
+                    .agent_name = Some(public_pane_id.clone());
+                assert!(server
+                    .app
+                    .resolve_exact_pane_target(&public_pane_id)
+                    .is_some());
+                server
+                    .app
+                    .state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .expect("terminal")
+                    .agent_name = None;
+
+                server
+                    .app
+                    .state
+                    .public_pane_id_aliases
+                    .insert(public_pane_id.clone(), pane_id);
+                assert!(server
+                    .app
+                    .resolve_exact_pane_target(&public_pane_id)
+                    .is_none());
+                server
+                    .app
+                    .state
+                    .public_pane_id_aliases
+                    .remove(&public_pane_id);
+            },
+        );
+    }
+
+    #[test]
+    fn exact_pane_resolver_preserves_adversarial_identity_invariants() {
+        let mut server = test_headless_server();
+        server.app.state = AppState::test_with_adversarial_identity_state();
+        server.app.state.assert_invariants_for_test();
+
+        let expected = server.app.state.workspaces[0]
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.layout.pane_ids())
+            .map(|pane_id| {
+                let workspace = &server.app.state.workspaces[0];
+                let number = workspace
+                    .public_pane_number(pane_id)
+                    .expect("public number");
+                (
+                    crate::workspace::public_pane_id_for_number(&workspace.id, number),
+                    pane_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (canonical, pane_id) in expected {
+            assert_eq!(
+                server
+                    .app
+                    .resolve_exact_pane_target(&canonical)
+                    .map(|target| target.pane_id),
+                Some(pane_id)
+            );
+        }
+        for alias in server
+            .app
+            .state
+            .public_pane_id_aliases
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            assert!(server.app.resolve_exact_pane_target(&alias).is_none());
+        }
+        server.app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn exact_pane_observer_first_frame_is_full_and_view_only() {
+        with_terminal_session_test_server(|server, terminal_id, _, public_pane_id| {
+            let initial_size = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .current_size();
+            let (_control_rx, render_rx) = connect_pending_exact_observer(server, 7);
+            assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                client_id: 7,
+                pane_id: public_pane_id,
+            }));
+
+            server.render_and_stream();
+            match read_server_message(render_rx.recv().expect("initial frame")) {
+                ServerMessage::Terminal(frame) => {
+                    assert_eq!(frame.seq, 1);
+                    assert!(frame.full);
+                    assert_eq!((frame.width, frame.height), (120, 40));
+                    assert!(frame.bytes.len() <= MAX_OBSERVATION_ANSI_BYTES);
+                }
+                other => panic!("expected terminal frame, got {other:?}"),
+            }
+            assert_eq!(
+                server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .expect("runtime")
+                    .current_size(),
+                initial_size
+            );
+            assert!(server.terminal_attach_owners.is_empty());
+        });
+    }
+
+    #[test]
+    fn exact_pane_observer_closes_on_terminal_reassociation() {
+        with_terminal_session_test_server(|server, _terminal_id, _, public_pane_id| {
+            let (control_rx, _render_rx) = connect_pending_exact_observer(server, 7);
+            assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                client_id: 7,
+                pane_id: public_pane_id,
+            }));
+            let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+            let replacement = crate::terminal::TerminalId::alloc();
+            server.app.state.terminals.insert(
+                replacement.clone(),
+                crate::terminal::TerminalState::new(replacement.clone(), std::env::temp_dir()),
+            );
+            server.app.terminal_runtimes.insert(
+                replacement.clone(),
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"replacement"),
+            );
+            server.app.state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane_id)
+                .expect("pane")
+                .attached_terminal_id = replacement;
+
+            server.render_and_stream();
+
+            assert!(!server.clients.contains_key(&7));
+            let (code, reason) = read_observation_close(control_rx.recv().expect("typed close"));
+            assert_eq!(code, ObservationCloseCode::PaneChanged);
+            assert!(reason.contains("no longer refers"));
+        });
+    }
+
+    #[test]
+    fn exact_pane_observer_closes_when_runtime_generation_changes() {
+        with_terminal_session_test_server(|server, terminal_id, _, public_pane_id| {
+            let (control_rx, _render_rx) = connect_pending_exact_observer(server, 7);
+            assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                client_id: 7,
+                pane_id: public_pane_id,
+            }));
+            server.app.terminal_runtimes.insert(
+                terminal_id,
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"new generation"),
+            );
+
+            server.render_and_stream();
+
+            let (code, _) = read_observation_close(control_rx.recv().expect("typed close"));
+            assert_eq!(code, ObservationCloseCode::PaneChanged);
+            assert!(!server.clients.contains_key(&7));
+        });
+    }
+
+    #[test]
+    fn exact_pane_observer_gets_typed_close_when_pane_disappears() {
+        with_terminal_session_test_server(|server, _terminal_id, _, public_pane_id| {
+            let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+            let (control_rx, _render_rx) = connect_pending_exact_observer(server, 7);
+            assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                client_id: 7,
+                pane_id: public_pane_id,
+            }));
+
+            assert!(server.handle_internal_event_with_forwarding(AppEvent::PaneDied { pane_id }));
+
+            let (code, reason) = read_observation_close(control_rx.recv().expect("typed close"));
+            assert_eq!(code, ObservationCloseCode::PaneUnavailable);
+            assert!(reason.contains("exited"));
+            assert!(!server.clients.contains_key(&7));
+        });
+    }
+
+    #[test]
+    fn exact_observer_discards_every_mutating_event_and_disconnect_is_pty_safe() {
+        with_terminal_session_test_server(
+            |server, terminal_id, terminal_id_string, public_pane_id| {
+                let (mut input_rx_runtime, replacement_runtime) = {
+                    let (runtime, input_rx) =
+                        crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+                    (input_rx, runtime)
+                };
+                server
+                    .app
+                    .terminal_runtimes
+                    .insert(terminal_id.clone(), replacement_runtime);
+                let initial_size = server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .expect("runtime")
+                    .current_size();
+                let (_control_rx, _render_rx) = connect_pending_exact_observer(server, 7);
+                assert!(!server.handle_server_event(ServerEvent::ClientInput {
+                    client_id: 7,
+                    data: b"pending-input".to_vec(),
+                }));
+                assert!(server
+                    .clients
+                    .get(&7)
+                    .is_some_and(|client| client.pending_exact_observe));
+                assert!(input_rx_runtime.try_recv().is_err());
+                assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                    client_id: 7,
+                    pane_id: public_pane_id.clone(),
+                }));
+
+                let mutations = vec![
+                    ServerEvent::ClientInput {
+                        client_id: 7,
+                        data: b"input".to_vec(),
+                    },
+                    ServerEvent::ClientInputEvents {
+                        client_id: 7,
+                        events: vec![crate::protocol::ClientInputEvent::FocusGained],
+                    },
+                    ServerEvent::ClientClipboardImage {
+                        client_id: 7,
+                        extension: "png".to_owned(),
+                        data: vec![1],
+                    },
+                    ServerEvent::ClientUpdateEnvironment {
+                        client_id: 7,
+                        vars: vec![("DISPLAY".to_owned(), Some(":9".to_owned()))],
+                    },
+                    ServerEvent::ClientAttachTerminal {
+                        client_id: 7,
+                        terminal_id: terminal_id_string.clone(),
+                        takeover: true,
+                    },
+                    ServerEvent::ClientObserveTerminal {
+                        client_id: 7,
+                        target: terminal_id_string.clone(),
+                    },
+                    ServerEvent::ClientObservePane {
+                        client_id: 7,
+                        pane_id: public_pane_id,
+                    },
+                    ServerEvent::ClientControlTerminal {
+                        client_id: 7,
+                        target: terminal_id_string,
+                        takeover: true,
+                    },
+                    ServerEvent::ClientAttachScroll {
+                        client_id: 7,
+                        source: AttachScrollSource::Wheel,
+                        direction: AttachScrollDirection::Up,
+                        lines: 10,
+                        column: None,
+                        row: None,
+                        modifiers: 0,
+                    },
+                    ServerEvent::ClientResize {
+                        client_id: 7,
+                        cols: 200,
+                        rows: 100,
+                        cell_width_px: 9,
+                        cell_height_px: 18,
+                    },
+                ];
+                for mutation in mutations {
+                    assert!(!server.handle_server_event(mutation));
+                    assert!(server
+                        .clients
+                        .get(&7)
+                        .is_some_and(ClientConnection::is_exact_observer));
+                }
+                assert!(input_rx_runtime.try_recv().is_err());
+                assert_eq!(
+                    server.clients.get(&7).expect("observer").terminal_size,
+                    (120, 40)
+                );
+                assert_eq!(
+                    server
+                        .app
+                        .terminal_runtimes
+                        .get(&terminal_id)
+                        .expect("runtime")
+                        .current_size(),
+                    initial_size
+                );
+                assert!(server.terminal_attach_owners.is_empty());
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 })
+                );
+                assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
+                assert_eq!(
+                    server
+                        .app
+                        .terminal_runtimes
+                        .get(&terminal_id)
+                        .expect("runtime")
+                        .current_size(),
+                    initial_size
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn exact_observer_cannot_displace_controller_and_disconnect_keeps_owner() {
+        with_terminal_session_test_server(
+            |server, _terminal_id, terminal_id_string, public_pane_id| {
+                connect_pending_terminal_client(server, 6);
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientControlTerminal {
+                        client_id: 6,
+                        target: terminal_id_string.clone(),
+                        takeover: false,
+                    })
+                );
+                let (_control_rx, _render_rx) = connect_pending_exact_observer(server, 7);
+                assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                    client_id: 7,
+                    pane_id: public_pane_id,
+                }));
+
+                assert!(
+                    !server.handle_server_event(ServerEvent::ClientControlTerminal {
+                        client_id: 7,
+                        target: terminal_id_string.clone(),
+                        takeover: true,
+                    })
+                );
+                assert_eq!(
+                    server.terminal_attach_owners.get(&terminal_id_string),
+                    Some(&6)
+                );
+                assert!(
+                    server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 })
+                );
+                assert_eq!(
+                    server.terminal_attach_owners.get(&terminal_id_string),
+                    Some(&6)
+                );
+                assert!(server.clients.contains_key(&6));
+            },
+        );
+    }
+
+    #[test]
+    fn blocked_exact_observer_coalesces_without_rendering_and_does_not_block_peer() {
+        with_terminal_session_test_server(|server, terminal_id, _, public_pane_id| {
+            let (_control_a, render_a) = connect_pending_exact_observer(server, 7);
+            let (_control_b, render_b) = connect_pending_exact_observer(server, 8);
+            for client_id in [7, 8] {
+                assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                    client_id,
+                    pane_id: public_pane_id.clone(),
+                }));
+            }
+            server.render_and_stream();
+            let initial_a = read_server_message(render_a.recv().expect("observer a initial frame"));
+            let initial_b = read_server_message(render_b.recv().expect("observer b initial frame"));
+            assert!(matches!(
+                initial_a,
+                ServerMessage::Terminal(crate::protocol::TerminalFrame {
+                    seq: 1,
+                    full: true,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                initial_b,
+                ServerMessage::Terminal(crate::protocol::TerminalFrame {
+                    seq: 1,
+                    full: true,
+                    ..
+                })
+            ));
+            assert!(!server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 8 }));
+
+            for output in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+                server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .expect("runtime")
+                    .test_process_pty_bytes(output);
+                server.render_and_stream();
+            }
+
+            assert!(
+                render_a.try_recv().is_err(),
+                "blocked observer receives no queued frame"
+            );
+            match read_server_message(render_b.recv().expect("peer observer frame")) {
+                ServerMessage::Terminal(frame) => assert_eq!(frame.seq, 2),
+                other => panic!("expected peer terminal frame, got {other:?}"),
+            }
+
+            assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 }));
+            server.render_and_stream();
+            match read_server_message(render_a.recv().expect("coalesced observer frame")) {
+                ServerMessage::Terminal(frame) => {
+                    assert_eq!(frame.seq, 2);
+                    assert!(!frame.bytes.is_empty());
+                }
+                other => panic!("expected coalesced terminal frame, got {other:?}"),
+            }
+            assert!(
+                render_a.try_recv().is_err(),
+                "coalescing emits one latest frame"
+            );
+        });
+    }
+
+    #[test]
+    fn exact_observer_closes_before_sequence_wraps() {
+        with_terminal_session_test_server(|server, _terminal_id, _, public_pane_id| {
+            let (control_rx, render_rx) = connect_pending_exact_observer(server, 7);
+            assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                client_id: 7,
+                pane_id: public_pane_id,
+            }));
+            server
+                .clients
+                .get_mut(&7)
+                .expect("observer")
+                .render_state
+                .set_terminal_seq_for_test(u64::MAX);
+
+            server.render_and_stream();
+
+            assert!(render_rx.try_recv().is_err());
+            let (code, reason) = read_observation_close(control_rx.recv().expect("typed close"));
+            assert_eq!(code, ObservationCloseCode::ProtocolError);
+            assert!(reason.contains("sequence exhausted"));
+            assert!(!server.clients.contains_key(&7));
+        });
     }
 
     #[test]
@@ -5202,6 +6085,77 @@ next_tab = ""
                 Some(ClientConnectionMode::TerminalObserve { terminal_id: observed })
                     if observed == &terminal_id.to_string()
             ));
+        });
+    }
+
+    #[test]
+    fn legacy_terminal_observe_resolves_agent_name_without_taking_ownership() {
+        with_terminal_session_test_server(|server, terminal_id, _, _| {
+            server
+                .app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("terminal")
+                .agent_name = Some("legacy-observer-target".to_owned());
+            connect_pending_terminal_client(server, 7);
+
+            assert!(
+                server.handle_server_event(ServerEvent::ClientObserveTerminal {
+                    client_id: 7,
+                    target: "legacy-observer-target".to_owned(),
+                })
+            );
+
+            assert!(matches!(
+                server.clients.get(&7).map(|client| &client.mode),
+                Some(ClientConnectionMode::TerminalObserve { terminal_id: observed })
+                    if observed == &terminal_id.to_string()
+            ));
+            assert!(server.terminal_attach_owners.is_empty());
+        });
+    }
+
+    #[test]
+    fn legacy_terminal_observer_discards_input_and_disconnect_preserves_runtime() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            let initial_size = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .current_size();
+            connect_pending_terminal_client(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientObserveTerminal {
+                    client_id: 7,
+                    target: terminal_id_string,
+                })
+            );
+
+            assert!(!server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 7,
+                data: b"must-not-reach-pty".to_vec(),
+            }));
+            assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 }));
+
+            assert!(!server.clients.contains_key(&7));
+            assert!(server.app.terminal_runtimes.get(&terminal_id).is_some());
+            assert_eq!(
+                server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .expect("runtime")
+                    .current_size(),
+                initial_size
+            );
+            assert!(server.terminal_attach_owners.is_empty());
+            assert!(!server
+                .app
+                .state
+                .direct_attach_resize_locks
+                .contains(&terminal_id));
         });
     }
 
@@ -5441,6 +6395,7 @@ next_tab = ""
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer,
         }));
 
@@ -5475,6 +6430,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            exact_observe_requested: false,
             writer,
         }));
 
@@ -5508,6 +6464,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            exact_observe_requested: false,
             writer,
         }));
         assert!(server.has_app_client());
@@ -5553,6 +6510,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            exact_observe_requested: false,
             writer,
         }));
         assert!(
@@ -7320,6 +8278,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            exact_observe_requested: false,
             writer,
         }));
         assert!(

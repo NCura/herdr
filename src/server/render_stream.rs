@@ -54,6 +54,7 @@ impl ClientRenderState {
                 })
             }
             Self::TerminalAnsi { blit_encoder, seq } => {
+                let next_seq = seq.checked_add(1)?;
                 if blit_encoder.is_current(&frame) {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
@@ -73,7 +74,7 @@ impl ClientRenderState {
                 );
                 Some(PreparedRender::TerminalAnsi {
                     message: ServerMessage::Terminal(TerminalFrame {
-                        seq: *seq + 1,
+                        seq: next_seq,
                         width: frame.width,
                         height: frame.height,
                         full: encoded.full,
@@ -110,7 +111,7 @@ impl ClientRenderState {
                 },
             ) => {
                 blit_encoder.commit(frame, encoded);
-                *seq += 1;
+                *seq = seq.saturating_add(1);
             }
             _ => {}
         }
@@ -121,6 +122,17 @@ impl ClientRenderState {
         match self {
             Self::Semantic { .. } => None,
             Self::TerminalAnsi { seq, .. } => Some(*seq),
+        }
+    }
+
+    pub(crate) fn terminal_sequence_exhausted(&self) -> bool {
+        matches!(self, Self::TerminalAnsi { seq: u64::MAX, .. })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_terminal_seq_for_test(&mut self, next: u64) {
+        if let Self::TerminalAnsi { seq, .. } = self {
+            *seq = next;
         }
     }
 }

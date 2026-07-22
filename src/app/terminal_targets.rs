@@ -10,6 +10,13 @@ pub(crate) struct TerminalTarget {
     pub terminal_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactPaneTarget {
+    pub pane_id: crate::layout::PaneId,
+    pub canonical_pane_id: String,
+    pub terminal_id: crate::terminal::TerminalId,
+}
+
 // Staged for #00f: ambiguity details are produced before the agent facade consumes them.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +43,60 @@ pub(crate) enum TerminalTargetError {
 }
 
 impl App {
+    /// Resolves only a current canonical public pane id, without any fallback namespace.
+    pub(crate) fn resolve_exact_pane_target(&self, target: &str) -> Option<ExactPaneTarget> {
+        if crate::protocol::validate_observation_pane_id(target).is_err()
+            || self.state.public_pane_id_aliases.contains_key(target)
+        {
+            return None;
+        }
+
+        let mut resolved = None;
+        for (ws_idx, workspace) in self.state.workspaces.iter().enumerate() {
+            for pane_id in workspace.tabs.iter().flat_map(|tab| tab.layout.pane_ids()) {
+                let canonical_pane_id = self.public_pane_id(ws_idx, pane_id)?;
+                if canonical_pane_id != target {
+                    continue;
+                }
+                if resolved.is_some() {
+                    return None;
+                }
+                let pane = workspace.pane_state(pane_id)?;
+                if !self
+                    .state
+                    .terminals
+                    .contains_key(&pane.attached_terminal_id)
+                {
+                    return None;
+                }
+                resolved = Some(ExactPaneTarget {
+                    pane_id,
+                    canonical_pane_id,
+                    terminal_id: pane.attached_terminal_id.clone(),
+                });
+            }
+        }
+        resolved
+    }
+
+    pub(crate) fn exact_pane_binding_is_current(
+        &self,
+        pane_id: crate::layout::PaneId,
+        canonical_pane_id: &str,
+        terminal_id: &str,
+        terminal_generation: &crate::terminal::TerminalRuntimeGeneration,
+    ) -> bool {
+        let Some((ws_idx, pane)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        self.public_pane_id(ws_idx, pane_id).as_deref() == Some(canonical_pane_id)
+            && pane.attached_terminal_id.to_string() == terminal_id
+            && self
+                .terminal_runtimes
+                .get(&pane.attached_terminal_id)
+                .is_some_and(|runtime| runtime.generation() == *terminal_generation)
+    }
+
     // Staged for #00f: current pane APIs stay pane-targeted while agent APIs will call this.
     #[allow(dead_code)]
     pub(crate) fn resolve_terminal_target(

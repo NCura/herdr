@@ -24,6 +24,20 @@ pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 /// image payloads that are naturally much larger after base64 encoding.
 pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
 
+/// Exact pane observers use a fixed presentation viewport, never PTY geometry.
+/// These conservative bounds include Fleet's 120x40 viewport with ample headroom.
+pub const MAX_OBSERVATION_COLS: u16 = 240;
+pub const MAX_OBSERVATION_ROWS: u16 = 120;
+pub const MAX_OBSERVATION_CELLS: usize = 20_000;
+/// Maximum canonical pane id accepted by the exact observation operation.
+pub const MAX_OBSERVATION_PANE_ID_BYTES: usize = 256;
+/// Public observation bridge records are bounded by the normal terminal frame cap.
+pub const MAX_OBSERVATION_NDJSON_RECORD_SIZE: usize = MAX_FRAME_SIZE;
+/// Leave enough room for JSON/base64 framing while keeping each record under 2 MB.
+pub const MAX_OBSERVATION_ANSI_BYTES: usize = (MAX_FRAME_SIZE - 1024) / 4 * 3;
+/// Human-readable observation close details are diagnostic, not an unbounded payload.
+pub const MAX_OBSERVATION_REASON_BYTES: usize = 512;
+
 /// Maximum clipboard image payload size for remote paste bridging.
 pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
 
@@ -59,6 +73,8 @@ pub enum ClientLaunchMode {
     App,
     /// Direct terminal attach client.
     TerminalAttach,
+    /// Exact, read-only canonical pane observation.
+    TerminalObserve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +421,12 @@ pub enum ClientMessage {
         /// from future pane spawn environments.
         vars: Vec<(String, Option<String>)>,
     },
+
+    /// Observe exactly one current canonical pane without target fallback.
+    ObservePane {
+        /// Current canonical public pane id.
+        pane_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +615,16 @@ pub struct TerminalFrame {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObservationCloseCode {
+    InvalidRequest,
+    PaneUnavailable,
+    PaneChanged,
+    FrameTooLarge,
+    ProtocolError,
+    Detached,
+}
+
 /// Notification kind forwarded from server to client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotifyKind {
@@ -674,6 +706,35 @@ pub enum ServerMessage {
         /// Whether the ASCII input source should be active.
         active: bool,
     },
+
+    /// An exact pane observation ended without affecting the observed PTY.
+    ObservationClosed {
+        code: ObservationCloseCode,
+        reason: String,
+    },
+}
+
+pub fn validate_observation_dimensions(cols: u16, rows: u16) -> Result<(), &'static str> {
+    if cols == 0 || rows == 0 {
+        return Err("observation dimensions must be non-zero");
+    }
+    if cols > MAX_OBSERVATION_COLS || rows > MAX_OBSERVATION_ROWS {
+        return Err("observation dimensions exceed the per-axis limit");
+    }
+    if usize::from(cols).saturating_mul(usize::from(rows)) > MAX_OBSERVATION_CELLS {
+        return Err("observation dimensions exceed the total-cell limit");
+    }
+    Ok(())
+}
+
+pub fn validate_observation_pane_id(pane_id: &str) -> Result<(), &'static str> {
+    if pane_id.is_empty() {
+        return Err("canonical pane id must not be empty");
+    }
+    if pane_id.len() > MAX_OBSERVATION_PANE_ID_BYTES {
+        return Err("canonical pane id exceeds the byte limit");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -871,16 +932,41 @@ pub fn read_message<R: Read, M: for<'de> Deserialize<'de>>(
     let mut payload = vec![0u8; claimed_len];
     read_exact_or_eof(reader, &mut payload)?;
 
-    let (msg, consumed) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-        .map_err(|e| FramingError::Bincode(e.to_string()))?;
+    decode_message_payload(&payload, max_frame_size)
+}
+
+pub(crate) fn decode_message_payload<M: for<'de> Deserialize<'de>>(
+    payload: &[u8],
+    max_frame_size: usize,
+) -> Result<M, FramingError> {
+    if payload.len() > max_frame_size {
+        return Err(FramingError::Oversized {
+            claimed: payload.len(),
+            max: max_frame_size,
+        });
+    }
+
+    let decoded = if max_frame_size <= MAX_FRAME_SIZE {
+        bincode::serde::decode_from_slice(
+            payload,
+            bincode::config::standard().with_limit::<MAX_FRAME_SIZE>(),
+        )
+    } else {
+        bincode::serde::decode_from_slice(
+            payload,
+            bincode::config::standard().with_limit::<MAX_GRAPHICS_FRAME_SIZE>(),
+        )
+    };
+    let (msg, consumed) = decoded.map_err(|e| FramingError::Bincode(e.to_string()))?;
 
     // Enforce that the decoder consumed the full payload.
     // Trailing bytes after the decoded message indicate a protocol violation
     // (e.g., a corrupted length prefix or concatenated payloads).
-    if consumed != claimed_len {
+    if consumed != payload.len() {
         return Err(FramingError::Bincode(format!(
-            "decoded {} bytes but payload length was {claimed_len}; trailing bytes are not allowed",
-            consumed
+            "decoded {} bytes but payload length was {}; trailing bytes are not allowed",
+            consumed,
+            payload.len()
         )));
     }
 
@@ -949,6 +1035,18 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
 mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
+    use serde::ser::SerializeSeq as _;
+
+    struct ClaimedOversizedSequence;
+
+    impl Serialize for ClaimedOversizedSequence {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_seq(Some(MAX_FRAME_SIZE + 1))?.end()
+        }
+    }
 
     // ---- Round-trip: ClientMessage ----
 
@@ -968,6 +1066,16 @@ mod tests {
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn bounded_decoder_rejects_container_claim_before_allocation() {
+        let payload =
+            bincode::serde::encode_to_vec(ClaimedOversizedSequence, bincode::config::standard())
+                .expect("encode malicious sequence claim");
+
+        let result = decode_message_payload::<Vec<u8>>(&payload, MAX_FRAME_SIZE);
+        assert!(matches!(result, Err(FramingError::Bincode(_))));
     }
 
     #[test]
@@ -1056,6 +1164,12 @@ mod tests {
         assert_eq!(
             tag(&ClientMessage::UpdateEnvironment { vars: Vec::new() }),
             10
+        );
+        assert_eq!(
+            tag(&ClientMessage::ObservePane {
+                pane_id: "w1:p1".to_owned(),
+            }),
+            11
         );
     }
 
@@ -1210,6 +1324,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_pane_observation_wire_contract_roundtrips() {
+        let hello = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 120,
+            rows: 40,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::TerminalObserve,
+        };
+        let request = ClientMessage::ObservePane {
+            pane_id: "w_live:p3".to_owned(),
+        };
+        for message in [hello, request] {
+            let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard())
+                .expect("encode exact observation message");
+            let (decoded, consumed): (ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                    .expect("decode exact observation message");
+            assert_eq!(decoded, message);
+            assert_eq!(consumed, encoded.len());
+        }
+    }
+
+    #[test]
+    fn observation_limits_accept_fleet_view_and_reject_axes_cells_and_ids() {
+        assert_eq!(validate_observation_dimensions(120, 40), Ok(()));
+        assert_eq!(validate_observation_dimensions(200, 100), Ok(()));
+        assert!(validate_observation_dimensions(0, 40).is_err());
+        assert!(validate_observation_dimensions(MAX_OBSERVATION_COLS + 1, 1).is_err());
+        assert!(validate_observation_dimensions(1, MAX_OBSERVATION_ROWS + 1).is_err());
+        assert!(validate_observation_dimensions(240, 120).is_err());
+        assert!(validate_observation_pane_id("").is_err());
+        assert!(
+            validate_observation_pane_id(&"p".repeat(MAX_OBSERVATION_PANE_ID_BYTES + 1)).is_err()
+        );
+    }
+
+    #[test]
     fn client_control_terminal_roundtrip() {
         let msg = ClientMessage::ControlTerminal {
             target: "w1:p1".to_owned(),
@@ -1250,6 +1404,42 @@ mod tests {
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_message_wire_tags_preserve_existing_protocol_17_order() {
+        fn tag(message: &ServerMessage) -> u8 {
+            *bincode::serde::encode_to_vec(message, bincode::config::standard())
+                .expect("encode server message")
+                .first()
+                .expect("encoded server message should include enum tag")
+        }
+
+        assert_eq!(
+            tag(&ServerMessage::Notify {
+                kind: NotifyKind::Sound,
+                message: String::new(),
+                body: None,
+            }),
+            5
+        );
+        assert_eq!(
+            tag(&ServerMessage::Clipboard {
+                data: String::new()
+            }),
+            6
+        );
+        assert_eq!(tag(&ServerMessage::WindowTitle { title: None }), 7);
+        assert_eq!(tag(&ServerMessage::ReloadSoundConfig), 8);
+        assert_eq!(tag(&ServerMessage::MouseCapture { enabled: false }), 9);
+        assert_eq!(tag(&ServerMessage::PrefixInputSource { active: false }), 10);
+        assert_eq!(
+            tag(&ServerMessage::ObservationClosed {
+                code: ObservationCloseCode::Detached,
+                reason: String::new(),
+            }),
+            11
+        );
     }
 
     #[test]
@@ -1353,6 +1543,19 @@ mod tests {
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn observation_closed_roundtrip() {
+        let message = ServerMessage::ObservationClosed {
+            code: ObservationCloseCode::PaneChanged,
+            reason: "pane terminal identity changed".to_owned(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+        let (decoded, consumed): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, message);
+        assert_eq!(consumed, encoded.len());
     }
 
     #[test]

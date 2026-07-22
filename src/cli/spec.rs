@@ -563,6 +563,13 @@ fn terminal_command() -> Command {
                         .arg(required("target", "TARGET"))
                         .arg(option("cols", "N"))
                         .arg(option("rows", "N")),
+                )
+                .subcommand(
+                    Command::new("observe-pane")
+                        .about("Observe one exact canonical pane read-only")
+                        .arg(required("pane_id", "PANE_ID"))
+                        .arg(option("cols", "N"))
+                        .arg(option("rows", "N")),
                 ),
         )
         .subcommand(

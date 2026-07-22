@@ -735,7 +735,7 @@ fn do_handshake(
     cell_width_px: u32,
     cell_height_px: u32,
     requested_encoding: RenderEncoding,
-    direct_attach_requested: bool,
+    launch_mode: ClientLaunchMode,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -750,11 +750,7 @@ fn do_handshake(
         cell_height_px,
         requested_encoding,
         keybindings: requested_keybindings(),
-        launch_mode: if direct_attach_requested {
-            ClientLaunchMode::TerminalAttach
-        } else {
-            ClientLaunchMode::App
-        },
+        launch_mode,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -848,10 +844,28 @@ pub fn run_terminal_attach(_terminal_id: String, _takeover: bool) -> io::Result<
 
 /// Runs a read-only terminal session observer and prints one JSON envelope per frame.
 pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
-    let mut stream =
-        connect_terminal_session_stream(target.clone(), cols, rows, "observing terminal session")?;
+    let mut stream = connect_terminal_session_stream(
+        target.clone(),
+        cols,
+        rows,
+        ClientLaunchMode::TerminalAttach,
+        "observing terminal session",
+    )?;
     write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
     write_terminal_session_output(stream)
+}
+
+/// Observes one exact current canonical pane through the bounded read-only contract.
+pub fn run_terminal_session_observe_pane(pane_id: String, cols: u16, rows: u16) -> io::Result<()> {
+    let mut stream = connect_terminal_session_stream(
+        pane_id.clone(),
+        cols,
+        rows,
+        ClientLaunchMode::TerminalObserve,
+        "observing exact pane",
+    )?;
+    write_to_server(&mut stream, &ClientMessage::ObservePane { pane_id })?;
+    write_exact_observation_output(stream)
 }
 
 /// Runs a writable terminal session controller.
@@ -865,6 +879,7 @@ pub fn run_terminal_session_control(
         target.clone(),
         cols,
         rows,
+        ClientLaunchMode::TerminalAttach,
         "controlling terminal session",
     )?;
     write_to_server(
@@ -905,6 +920,7 @@ fn connect_terminal_session_stream(
     target: String,
     cols: u16,
     rows: u16,
+    launch_mode: ClientLaunchMode,
     log_message: &'static str,
 ) -> io::Result<LocalStream> {
     init_logging();
@@ -928,7 +944,7 @@ fn connect_terminal_session_stream(
         0,
         0,
         RenderEncoding::TerminalAnsi,
-        true,
+        launch_mode,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -950,38 +966,268 @@ fn connect_terminal_session_stream(
 fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     loop {
-        match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE) {
+        match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {
             Ok(ServerMessage::Terminal(frame)) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&frame.bytes);
-                let line = serde_json::json!({
-                    "type": "terminal.frame",
-                    "seq": frame.seq,
-                    "encoding": "ansi",
-                    "width": frame.width,
-                    "height": frame.height,
-                    "full": frame.full,
-                    "bytes": encoded,
-                });
-                serde_json::to_writer(&mut stdout, &line)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                if frame.bytes.len() > crate::protocol::MAX_OBSERVATION_ANSI_BYTES {
+                    write_legacy_terminal_closed_record(
+                        &mut stdout,
+                        "terminal frame exceeds the public record limit",
+                    )?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "terminal frame exceeds the public record limit",
+                    ));
+                }
+                write_terminal_frame_record(&mut stdout, &frame)?;
             }
             Ok(ServerMessage::ServerShutdown { reason }) => {
-                let line = serde_json::json!({
-                    "type": "terminal.closed",
-                    "reason": reason,
-                });
-                serde_json::to_writer(&mut stdout, &line)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                write_legacy_terminal_closed_record(
+                    &mut stdout,
+                    reason
+                        .as_deref()
+                        .unwrap_or("server closed the terminal stream"),
+                )?;
+                return Ok(());
+            }
+            Ok(ServerMessage::ObservationClosed { code, reason }) => {
+                write_observation_closed_record(&mut stdout, code, &reason)?;
                 return Ok(());
             }
             Ok(ServerMessage::Graphics { .. }) => {}
             Ok(_) => {}
-            Err(protocol::FramingError::UnexpectedEof) => return Ok(()),
-            Err(err) => return Err(io::Error::other(err.to_string())),
+            Err(protocol::FramingError::UnexpectedEof) => {
+                write_observation_closed_record(
+                    &mut stdout,
+                    crate::protocol::ObservationCloseCode::ProtocolError,
+                    "observation transport disconnected",
+                )?;
+                return Ok(());
+            }
+            Err(protocol::FramingError::Oversized { .. }) => {
+                let reason = "observation transport frame exceeds the terminal frame limit";
+                write_observation_closed_record(
+                    &mut stdout,
+                    crate::protocol::ObservationCloseCode::FrameTooLarge,
+                    reason,
+                )?;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+            }
+            Err(err) => {
+                let reason = "observation transport frame is malformed";
+                write_observation_closed_record(
+                    &mut stdout,
+                    crate::protocol::ObservationCloseCode::ProtocolError,
+                    reason,
+                )?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{reason}: {err}"),
+                ));
+            }
         }
     }
+}
+
+#[derive(Default)]
+struct ExactObservationSequence {
+    last: Option<u64>,
+}
+
+fn write_exact_observation_output(mut stream: LocalStream) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    let mut sequence = ExactObservationSequence::default();
+    loop {
+        match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {
+            Ok(ServerMessage::Terminal(frame)) => {
+                if let Err(reason) = validate_exact_observation_frame(&frame, &mut sequence) {
+                    write_observation_closed_record(
+                        &mut stdout,
+                        crate::protocol::ObservationCloseCode::ProtocolError,
+                        reason,
+                    )?;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+                }
+                write_terminal_frame_record(&mut stdout, &frame)?;
+            }
+            Ok(ServerMessage::ObservationClosed { code, reason }) => {
+                if reason.len() > crate::protocol::MAX_OBSERVATION_REASON_BYTES {
+                    let message = "server sent an oversized observation close reason";
+                    write_observation_closed_record(
+                        &mut stdout,
+                        crate::protocol::ObservationCloseCode::ProtocolError,
+                        message,
+                    )?;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+                }
+                write_observation_closed_record(&mut stdout, code, &reason)?;
+                return Ok(());
+            }
+            Ok(ServerMessage::ServerShutdown { reason }) => {
+                let reason = reason.as_deref().unwrap_or("server closed the observation");
+                write_observation_closed_record(
+                    &mut stdout,
+                    crate::protocol::ObservationCloseCode::ProtocolError,
+                    reason,
+                )?;
+                return Ok(());
+            }
+            Ok(_) => {
+                let reason = "unexpected message on exact observation stream";
+                write_observation_closed_record(
+                    &mut stdout,
+                    crate::protocol::ObservationCloseCode::ProtocolError,
+                    reason,
+                )?;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+            }
+            Err(err) => return write_exact_observation_transport_error(&mut stdout, err),
+        }
+    }
+}
+
+fn write_exact_observation_transport_error(
+    writer: &mut impl std::io::Write,
+    error: protocol::FramingError,
+) -> io::Result<()> {
+    match error {
+        protocol::FramingError::UnexpectedEof => write_observation_closed_record(
+            writer,
+            crate::protocol::ObservationCloseCode::ProtocolError,
+            "observation transport disconnected",
+        ),
+        protocol::FramingError::Oversized { .. } => {
+            let reason = "observation transport frame exceeds the terminal frame limit";
+            write_observation_closed_record(
+                writer,
+                crate::protocol::ObservationCloseCode::FrameTooLarge,
+                reason,
+            )?;
+            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+        }
+        error => {
+            let reason = "observation transport frame is malformed";
+            write_observation_closed_record(
+                writer,
+                crate::protocol::ObservationCloseCode::ProtocolError,
+                reason,
+            )?;
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{reason}: {error}"),
+            ))
+        }
+    }
+}
+
+fn validate_exact_observation_frame(
+    frame: &crate::protocol::TerminalFrame,
+    sequence: &mut ExactObservationSequence,
+) -> Result<(), &'static str> {
+    crate::protocol::validate_observation_dimensions(frame.width, frame.height)
+        .map_err(|_| "server sent invalid observation dimensions")?;
+    if frame.bytes.len() > crate::protocol::MAX_OBSERVATION_ANSI_BYTES {
+        return Err("server sent an oversized observation frame");
+    }
+    match sequence.last {
+        None if frame.seq != 1 || !frame.full => {
+            return Err("first observation frame must be full with sequence 1");
+        }
+        Some(last) => match last.checked_add(1) {
+            Some(expected) if frame.seq == expected => {}
+            Some(_) => return Err("observation frame sequence is not contiguous"),
+            None => return Err("observation frame sequence overflowed"),
+        },
+        _ => {}
+    }
+    sequence.last = Some(frame.seq);
+    Ok(())
+}
+
+fn write_terminal_frame_record(
+    writer: &mut impl std::io::Write,
+    frame: &crate::protocol::TerminalFrame,
+) -> io::Result<()> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&frame.bytes);
+    write_observation_record(
+        writer,
+        &serde_json::json!({
+            "type": "terminal.frame",
+            "seq": frame.seq,
+            "encoding": "ansi",
+            "width": frame.width,
+            "height": frame.height,
+            "full": frame.full,
+            "bytes": encoded,
+        }),
+    )
+}
+
+fn write_observation_closed_record(
+    writer: &mut impl std::io::Write,
+    code: crate::protocol::ObservationCloseCode,
+    reason: &str,
+) -> io::Result<()> {
+    let reason = truncate_utf8(reason, crate::protocol::MAX_OBSERVATION_REASON_BYTES);
+    write_observation_record(
+        writer,
+        &serde_json::json!({
+            "type": "terminal.closed",
+            "code": observation_close_code(code),
+            "reason": reason,
+        }),
+    )
+}
+
+fn write_legacy_terminal_closed_record(
+    writer: &mut impl std::io::Write,
+    reason: &str,
+) -> io::Result<()> {
+    write_observation_record(
+        writer,
+        &serde_json::json!({
+            "type": "terminal.closed",
+            "reason": truncate_utf8(reason, crate::protocol::MAX_OBSERVATION_REASON_BYTES),
+        }),
+    )
+}
+
+fn write_observation_record(
+    writer: &mut impl std::io::Write,
+    value: &serde_json::Value,
+) -> io::Result<()> {
+    let encoded = serde_json::to_vec(value)?;
+    if encoded.len().saturating_add(1) > crate::protocol::MAX_OBSERVATION_NDJSON_RECORD_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "encoded observation record exceeds the byte limit",
+        ));
+    }
+    writer.write_all(&encoded)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn observation_close_code(code: crate::protocol::ObservationCloseCode) -> &'static str {
+    use crate::protocol::ObservationCloseCode;
+    match code {
+        ObservationCloseCode::InvalidRequest => "invalid_request",
+        ObservationCloseCode::PaneUnavailable => "pane_unavailable",
+        ObservationCloseCode::PaneChanged => "pane_changed",
+        ObservationCloseCode::FrameTooLarge => "frame_too_large",
+        ObservationCloseCode::ProtocolError => "protocol_error",
+        ObservationCloseCode::Detached => "detached",
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[derive(serde::Deserialize)]
@@ -1160,7 +1406,11 @@ fn run_client_with_mode(
         cell_width_px,
         cell_height_px,
         requested_encoding,
-        direct_attach_requested,
+        if direct_attach_requested {
+            ClientLaunchMode::TerminalAttach
+        } else {
+            ClientLaunchMode::App
+        },
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -1613,6 +1863,9 @@ async fn run_client_loop(
                 }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
+                }
+                ServerMessage::ObservationClosed { code, reason } => {
+                    debug!(?code, reason, "received observation closure in app client");
                 }
             },
             ClientLoopEvent::ServerDisconnected => {
@@ -2158,6 +2411,131 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn exact_observation_requires_full_first_contiguous_frames() {
+        let mut sequence = ExactObservationSequence::default();
+        let mut frame = crate::protocol::TerminalFrame {
+            seq: 1,
+            width: 120,
+            height: 40,
+            full: true,
+            bytes: b"full".to_vec(),
+        };
+        assert_eq!(
+            validate_exact_observation_frame(&frame, &mut sequence),
+            Ok(())
+        );
+        frame.seq = 2;
+        frame.full = false;
+        assert_eq!(
+            validate_exact_observation_frame(&frame, &mut sequence),
+            Ok(())
+        );
+        frame.seq = 4;
+        assert!(validate_exact_observation_frame(&frame, &mut sequence).is_err());
+
+        let mut sequence = ExactObservationSequence::default();
+        frame.seq = 1;
+        frame.full = false;
+        assert!(validate_exact_observation_frame(&frame, &mut sequence).is_err());
+
+        let mut sequence = ExactObservationSequence {
+            last: Some(u64::MAX),
+        };
+        frame.seq = u64::MAX;
+        assert_eq!(
+            validate_exact_observation_frame(&frame, &mut sequence),
+            Err("observation frame sequence overflowed")
+        );
+    }
+
+    #[test]
+    fn exact_observation_rejects_oversized_initial_and_incremental_frames() {
+        for (seq, full, previous) in [(1, true, None), (2, false, Some(1))] {
+            let mut sequence = ExactObservationSequence { last: previous };
+            let frame = crate::protocol::TerminalFrame {
+                seq,
+                width: 120,
+                height: 40,
+                full,
+                bytes: vec![b'x'; crate::protocol::MAX_OBSERVATION_ANSI_BYTES + 1],
+            };
+            assert_eq!(
+                validate_exact_observation_frame(&frame, &mut sequence),
+                Err("server sent an oversized observation frame")
+            );
+        }
+    }
+
+    #[test]
+    fn observation_ndjson_records_and_reasons_are_bounded() {
+        let frame = crate::protocol::TerminalFrame {
+            seq: 1,
+            width: 120,
+            height: 40,
+            full: true,
+            bytes: vec![b'x'; crate::protocol::MAX_OBSERVATION_ANSI_BYTES],
+        };
+        let mut output = Vec::new();
+        write_terminal_frame_record(&mut output, &frame).expect("maximum frame record fits");
+        assert!(output.len() <= crate::protocol::MAX_OBSERVATION_NDJSON_RECORD_SIZE);
+        assert_eq!(output.last(), Some(&b'\n'));
+
+        let mut closed = Vec::new();
+        write_observation_closed_record(
+            &mut closed,
+            crate::protocol::ObservationCloseCode::FrameTooLarge,
+            &"é".repeat(crate::protocol::MAX_OBSERVATION_REASON_BYTES),
+        )
+        .expect("bounded close record");
+        let value: serde_json::Value = serde_json::from_slice(&closed).expect("valid close JSON");
+        assert_eq!(value["code"], "frame_too_large");
+        assert!(
+            value["reason"].as_str().expect("reason").len()
+                <= crate::protocol::MAX_OBSERVATION_REASON_BYTES
+        );
+
+        let mut rejected = Vec::new();
+        assert!(write_observation_record(
+            &mut rejected,
+            &serde_json::json!({"oversized": "x".repeat(crate::protocol::MAX_OBSERVATION_NDJSON_RECORD_SIZE)})
+        )
+        .is_err());
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn exact_observation_transport_failures_emit_typed_close_records() {
+        for (error, expected_code, succeeds) in [
+            (
+                protocol::FramingError::UnexpectedEof,
+                "protocol_error",
+                true,
+            ),
+            (
+                protocol::FramingError::Oversized {
+                    claimed: crate::protocol::MAX_FRAME_SIZE + 1,
+                    max: crate::protocol::MAX_FRAME_SIZE,
+                },
+                "frame_too_large",
+                false,
+            ),
+            (
+                protocol::FramingError::Bincode("bad frame".to_owned()),
+                "protocol_error",
+                false,
+            ),
+        ] {
+            let mut output = Vec::new();
+            let result = write_exact_observation_transport_error(&mut output, error);
+            assert_eq!(result.is_ok(), succeeds);
+            let value: serde_json::Value =
+                serde_json::from_slice(&output).expect("typed close JSON");
+            assert_eq!(value["type"], "terminal.closed");
+            assert_eq!(value["code"], expected_code);
+        }
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

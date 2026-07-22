@@ -142,6 +142,19 @@ bytes, then a `terminal.closed` record when the server closes the stream.
 Multiple observers can watch the same terminal without taking input, resize,
 scroll, or takeover ownership.
 
+Bridges that need a fail-closed pane identity should use the dedicated exact
+operation with a current canonical pane ID:
+
+```bash
+herdr terminal session observe-pane w1:p1 --cols 120 --rows 40
+```
+
+This path rejects generic targets and identity aliases, keeps its dimensions
+view-only, sends a full sequence-1 frame first, bounds and coalesces output, and
+leaves the PTY process and controller ownership untouched on disconnect. Verify
+the complete contract through `capabilities.terminal_observation` in
+`herdr status server --json` before starting a bridge.
+
 For an interactive bridge, use a writable terminal session controller:
 
 ```bash

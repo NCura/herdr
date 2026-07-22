@@ -525,6 +525,7 @@ fn success_response_round_trips() {
             capabilities: Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                terminal_observation: Some(TerminalObservationCapabilities::current()),
             }),
         },
     };
@@ -532,6 +533,36 @@ fn success_response_round_trips() {
     let json = serde_json::to_string(&response).unwrap();
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn terminal_observation_capabilities_are_fail_closed_and_report_limits() {
+    let capabilities = TerminalObservationCapabilities::current();
+    assert!(capabilities.exact_pane);
+    assert!(capabilities.read_only);
+    assert!(capabilities.view_only_dimensions);
+    assert!(capabilities.full_frame_first);
+    assert!(capabilities.bounded_frames);
+    assert!(capabilities.coalesced_updates);
+    assert!(capabilities.pty_survives_disconnect);
+    assert_eq!(capabilities.max_cols, crate::protocol::MAX_OBSERVATION_COLS);
+    assert_eq!(capabilities.max_rows, crate::protocol::MAX_OBSERVATION_ROWS);
+    assert_eq!(
+        capabilities.max_cells,
+        crate::protocol::MAX_OBSERVATION_CELLS as u32
+    );
+    assert_eq!(
+        capabilities.max_frame_bytes,
+        crate::protocol::MAX_FRAME_SIZE as u32
+    );
+    assert_eq!(
+        capabilities.max_ansi_bytes,
+        crate::protocol::MAX_OBSERVATION_ANSI_BYTES as u32
+    );
+    assert_eq!(
+        capabilities.max_record_bytes,
+        crate::protocol::MAX_OBSERVATION_NDJSON_RECORD_SIZE as u32
+    );
 }
 
 #[test]
