@@ -25,8 +25,8 @@ pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
 
 /// Exact pane observers use a fixed presentation viewport, never PTY geometry.
-/// These conservative bounds include Fleet's 120x40 viewport with ample headroom.
-pub const MAX_OBSERVATION_COLS: u16 = 240;
+/// These conservative bounds include Fleet's current exact-pane widths with headroom.
+pub const MAX_OBSERVATION_COLS: u16 = 320;
 pub const MAX_OBSERVATION_ROWS: u16 = 120;
 pub const MAX_OBSERVATION_CELLS: usize = 20_000;
 /// Maximum canonical pane id accepted by the exact observation operation.
@@ -1351,12 +1351,17 @@ mod tests {
 
     #[test]
     fn observation_limits_accept_fleet_view_and_reject_axes_cells_and_ids() {
+        assert_eq!(MAX_OBSERVATION_COLS, 320);
+        assert_eq!(MAX_OBSERVATION_ROWS, 120);
+        assert_eq!(MAX_OBSERVATION_CELLS, 20_000);
         assert_eq!(validate_observation_dimensions(120, 40), Ok(()));
         assert_eq!(validate_observation_dimensions(200, 100), Ok(()));
+        assert_eq!(validate_observation_dimensions(300, 66), Ok(()));
+        assert_eq!(validate_observation_dimensions(320, 62), Ok(()));
         assert!(validate_observation_dimensions(0, 40).is_err());
-        assert!(validate_observation_dimensions(MAX_OBSERVATION_COLS + 1, 1).is_err());
-        assert!(validate_observation_dimensions(1, MAX_OBSERVATION_ROWS + 1).is_err());
-        assert!(validate_observation_dimensions(240, 120).is_err());
+        assert!(validate_observation_dimensions(321, 1).is_err());
+        assert!(validate_observation_dimensions(1, 121).is_err());
+        assert!(validate_observation_dimensions(320, 63).is_err());
         assert!(validate_observation_pane_id("").is_err());
         assert!(
             validate_observation_pane_id(&"p".repeat(MAX_OBSERVATION_PANE_ID_BYTES + 1)).is_err()

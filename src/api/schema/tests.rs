@@ -545,24 +545,12 @@ fn terminal_observation_capabilities_are_fail_closed_and_report_limits() {
     assert!(capabilities.bounded_frames);
     assert!(capabilities.coalesced_updates);
     assert!(capabilities.pty_survives_disconnect);
-    assert_eq!(capabilities.max_cols, crate::protocol::MAX_OBSERVATION_COLS);
-    assert_eq!(capabilities.max_rows, crate::protocol::MAX_OBSERVATION_ROWS);
-    assert_eq!(
-        capabilities.max_cells,
-        crate::protocol::MAX_OBSERVATION_CELLS as u32
-    );
-    assert_eq!(
-        capabilities.max_frame_bytes,
-        crate::protocol::MAX_FRAME_SIZE as u32
-    );
-    assert_eq!(
-        capabilities.max_ansi_bytes,
-        crate::protocol::MAX_OBSERVATION_ANSI_BYTES as u32
-    );
-    assert_eq!(
-        capabilities.max_record_bytes,
-        crate::protocol::MAX_OBSERVATION_NDJSON_RECORD_SIZE as u32
-    );
+    assert_eq!(capabilities.max_cols, 320);
+    assert_eq!(capabilities.max_rows, 120);
+    assert_eq!(capabilities.max_cells, 20_000);
+    assert_eq!(capabilities.max_frame_bytes, 2_097_152);
+    assert_eq!(capabilities.max_ansi_bytes, 1_572_096);
+    assert_eq!(capabilities.max_record_bytes, 2_097_152);
 }
 
 #[test]

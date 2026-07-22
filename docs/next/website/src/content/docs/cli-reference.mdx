@@ -304,7 +304,7 @@ the current canonical pane ID returned by Herdr, with no terminal ID, agent
 label, alias, stale-ID, or current-pane fallback. The observer is bound to that
 pane, terminal ID, and terminal runtime generation and closes if any identity
 changes. Its dimensions affect only the rendered view and never resize the PTY.
-Dimensions are limited to 240 columns, 120 rows, and 20,000 total cells; the
+Dimensions are limited to 320 columns, 120 rows, and 20,000 total cells; the
 default is 120x40. The first `terminal.frame` is full with sequence 1, later
 frames are contiguous and coalesced when the writer is blocked. Binary wire
 frames and encoded NDJSON records are each limited to 2 MB; ANSI payloads use

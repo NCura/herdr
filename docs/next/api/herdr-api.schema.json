@@ -9202,6 +9202,7 @@
               "type": "integer"
             },
             "max_cols": {
+              "description": "Maximum accepted presentation viewport width in columns.",
               "format": "uint16",
               "maximum": 65535,
               "minimum": 0,
@@ -9218,6 +9219,7 @@
               "type": "integer"
             },
             "max_rows": {
+              "description": "Maximum accepted presentation viewport height in rows.",
               "format": "uint16",
               "maximum": 65535,
               "minimum": 0,

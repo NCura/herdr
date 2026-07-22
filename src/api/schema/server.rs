@@ -31,7 +31,9 @@ pub struct TerminalObservationCapabilities {
     pub bounded_frames: bool,
     pub coalesced_updates: bool,
     pub pty_survives_disconnect: bool,
+    /// Maximum accepted presentation viewport width in columns.
     pub max_cols: u16,
+    /// Maximum accepted presentation viewport height in rows.
     pub max_rows: u16,
     pub max_cells: u32,
     pub max_frame_bytes: u32,
