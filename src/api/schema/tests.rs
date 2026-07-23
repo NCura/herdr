@@ -541,6 +541,7 @@ fn terminal_observation_capabilities_are_fail_closed_and_report_limits() {
     assert!(capabilities.exact_pane);
     assert!(capabilities.read_only);
     assert!(capabilities.view_only_dimensions);
+    assert!(capabilities.native_dimensions);
     assert!(capabilities.full_frame_first);
     assert!(capabilities.bounded_frames);
     assert!(capabilities.coalesced_updates);

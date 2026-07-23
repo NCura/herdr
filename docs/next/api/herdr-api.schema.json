@@ -9225,6 +9225,11 @@
               "minimum": 0,
               "type": "integer"
             },
+            "native_dimensions": {
+              "default": false,
+              "description": "Omitted exact-pane dimensions use the current pane runtime geometry.",
+              "type": "boolean"
+            },
             "pty_survives_disconnect": {
               "type": "boolean"
             },

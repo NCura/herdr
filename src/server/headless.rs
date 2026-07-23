@@ -1752,7 +1752,7 @@ impl HeadlessServer {
         let pending = self.clients.get(&client_id).is_some_and(|client| {
             client.pending_exact_observe
                 && matches!(client.mode, ClientConnectionMode::App)
-                && protocol::validate_observation_dimensions(
+                && protocol::validate_exact_observer_hello_dimensions(
                     client.terminal_size.0,
                     client.terminal_size.1,
                 )
@@ -1787,11 +1787,39 @@ impl HeadlessServer {
             return false;
         };
         let terminal_generation = runtime.generation();
+        let runtime_dimensions = runtime.current_size();
+        let Some(requested_dimensions) = self
+            .clients
+            .get(&client_id)
+            .map(|client| client.terminal_size)
+        else {
+            return false;
+        };
+        let native_dimensions = protocol::uses_native_observation_dimensions(
+            requested_dimensions.0,
+            requested_dimensions.1,
+        );
+        let resolved_dimensions = if native_dimensions {
+            let (rows, cols) = runtime_dimensions;
+            (cols, rows)
+        } else {
+            requested_dimensions
+        };
+        if let Err(reason) =
+            protocol::validate_observation_dimensions(resolved_dimensions.0, resolved_dimensions.1)
+        {
+            let reason = format!("pane runtime dimensions cannot be observed: {reason}");
+            self.close_exact_observer(client_id, ObservationCloseCode::InvalidRequest, &reason);
+            return false;
+        }
         let terminal_id = target.terminal_id.to_string();
         let stamp = self.allocate_activity_stamp();
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
         };
+        if native_dimensions {
+            client.terminal_size = resolved_dimensions;
+        }
         client.mode = ClientConnectionMode::ExactPaneObserve {
             pane_id: target.pane_id,
             canonical_pane_id: target.canonical_pane_id,
@@ -2874,7 +2902,7 @@ impl HeadlessServer {
                     return false;
                 }
                 if exact_observe_requested
-                    && protocol::validate_observation_dimensions(cols, rows).is_err()
+                    && protocol::validate_exact_observer_hello_dimensions(cols, rows).is_err()
                 {
                     if let Ok(message) =
                         Self::frame_server_message(&ServerMessage::ObservationClosed {
@@ -5453,11 +5481,22 @@ next_tab = ""
         std::sync::mpsc::Receiver<Vec<u8>>,
         std::sync::mpsc::Receiver<Vec<u8>>,
     ) {
+        connect_pending_exact_observer_with_dimensions(server, client_id, (120, 40))
+    }
+
+    fn connect_pending_exact_observer_with_dimensions(
+        server: &mut HeadlessServer,
+        client_id: u64,
+        dimensions: (u16, u16),
+    ) -> (
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
         let (writer, control_rx, render_rx) = test_client_writer();
         assert!(server.handle_server_event(ServerEvent::ClientConnected {
             client_id,
-            cols: 120,
-            rows: 40,
+            cols: dimensions.0,
+            rows: dimensions.1,
             cell_width_px: 0,
             cell_height_px: 0,
             render_encoding: RenderEncoding::TerminalAnsi,
@@ -5692,6 +5731,92 @@ next_tab = ""
                 initial_size
             );
             assert!(server.terminal_attach_owners.is_empty());
+        });
+    }
+
+    #[test]
+    fn exact_pane_observer_uses_native_runtime_dimensions_without_resizing_pty() {
+        with_terminal_session_test_server(|server, terminal_id, _, public_pane_id| {
+            let initial_size = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .current_size();
+            let (_control_rx, render_rx) = connect_pending_exact_observer_with_dimensions(
+                server,
+                7,
+                protocol::NATIVE_OBSERVATION_DIMENSIONS,
+            );
+
+            assert!(server.handle_server_event(ServerEvent::ClientObservePane {
+                client_id: 7,
+                pane_id: public_pane_id,
+            }));
+            assert_eq!(
+                server.clients.get(&7).expect("observer").terminal_size,
+                (initial_size.1, initial_size.0)
+            );
+
+            server.render_and_stream();
+            match read_server_message(render_rx.recv().expect("initial frame")) {
+                ServerMessage::Terminal(frame) => {
+                    assert_eq!(
+                        (frame.width, frame.height),
+                        (initial_size.1, initial_size.0)
+                    );
+                    assert!(frame.full);
+                }
+                other => panic!("expected terminal frame, got {other:?}"),
+            }
+            assert_eq!(
+                server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .expect("runtime")
+                    .current_size(),
+                initial_size
+            );
+        });
+    }
+
+    #[test]
+    fn exact_pane_observer_rejects_native_runtime_dimensions_over_bounds() {
+        with_terminal_session_test_server(|server, terminal_id, _, public_pane_id| {
+            server.app.terminal_runtimes.insert(
+                terminal_id.clone(),
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(250, 81, b""),
+            );
+            let initial_size = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .current_size();
+            let (control_rx, _render_rx) = connect_pending_exact_observer_with_dimensions(
+                server,
+                7,
+                protocol::NATIVE_OBSERVATION_DIMENSIONS,
+            );
+
+            assert!(!server.handle_server_event(ServerEvent::ClientObservePane {
+                client_id: 7,
+                pane_id: public_pane_id,
+            }));
+            let (code, reason) = read_observation_close(control_rx.recv().expect("typed close"));
+            assert_eq!(code, ObservationCloseCode::InvalidRequest);
+            assert!(reason.contains("total-cell limit"));
+            assert!(!server.clients.contains_key(&7));
+            assert_eq!(
+                server
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .expect("runtime")
+                    .current_size(),
+                initial_size
+            );
         });
     }
 

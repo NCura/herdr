@@ -586,7 +586,7 @@ pub(crate) fn handle_client_handshake(
 
             let exact_observe_requested = launch_mode == ClientLaunchMode::TerminalObserve;
             if exact_observe_requested {
-                let invalid = protocol::validate_observation_dimensions(cols, rows)
+                let invalid = protocol::validate_exact_observer_hello_dimensions(cols, rows)
                     .err()
                     .or_else(|| {
                         (requested_encoding != RenderEncoding::TerminalAnsi)
@@ -1534,11 +1534,14 @@ new_tab = "ctrl+notakey"
         ));
         let writer = match server_event_rx.blocking_recv().expect("connected event") {
             ServerEvent::ClientConnected {
+                cols,
+                rows,
                 direct_attach_requested,
                 exact_observe_requested,
                 writer,
                 ..
             } => {
+                assert_eq!((cols, rows), (120, 40));
                 assert!(!direct_attach_requested);
                 assert!(exact_observe_requested);
                 writer
@@ -1558,6 +1561,55 @@ new_tab = "ctrl+notakey"
             ServerEvent::ClientObservePane { client_id: 42, pane_id }
                 if pane_id == "w_live:p1"
         ));
+
+        drop(writer);
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle.join().expect("handshake thread").expect("handshake");
+    }
+
+    #[test]
+    fn handshake_preserves_native_exact_observer_sentinel() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-handshake-native-exact-observer");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(2);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+        });
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: protocol::NATIVE_OBSERVATION_DIMENSIONS.0,
+                rows: protocol::NATIVE_OBSERVATION_DIMENSIONS.1,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalObserve,
+            },
+        )
+        .expect("write native observer hello");
+        assert!(matches!(
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("welcome"),
+            ServerMessage::Welcome { error: None, .. }
+        ));
+        let writer = match server_event_rx.blocking_recv().expect("connected event") {
+            ServerEvent::ClientConnected {
+                cols,
+                rows,
+                exact_observe_requested,
+                writer,
+                ..
+            } => {
+                assert_eq!((cols, rows), protocol::NATIVE_OBSERVATION_DIMENSIONS);
+                assert!(exact_observe_requested);
+                writer
+            }
+            other => panic!("expected connected event, got {other:?}"),
+        };
 
         drop(writer);
         drop(client_stream);

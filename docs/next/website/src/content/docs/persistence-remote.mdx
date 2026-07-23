@@ -146,11 +146,13 @@ Bridges that need a fail-closed pane identity should use the dedicated exact
 operation with a current canonical pane ID:
 
 ```bash
-herdr terminal session observe-pane w1:p1 --cols 120 --rows 40
+herdr terminal session observe-pane w1:p1
 ```
 
-This path rejects generic targets and identity aliases, keeps its dimensions
-view-only, sends a full sequence-1 frame first, bounds and coalesces output, and
+This path rejects generic targets and identity aliases. With no dimension flags,
+it uses the pane runtime's current bounded dimensions as view-only geometry;
+explicit flags keep fixed view-only geometry. It sends a full sequence-1 frame
+first, bounds and coalesces output, and
 leaves the PTY process and controller ownership untouched on disconnect. Verify
 the complete contract through `capabilities.terminal_observation` in
 `herdr status server --json` before starting a bridge.

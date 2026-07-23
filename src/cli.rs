@@ -595,12 +595,22 @@ fn terminal_session_observe_pane(args: &[String]) -> std::io::Result<i32> {
         Ok(options) => options,
         Err(code) => return Ok(code),
     };
-    validate_observation_dimensions(options.cols, options.rows)?;
+    let (cols, rows) = exact_pane_observation_dimensions(&options)?;
     crate::protocol::validate_observation_pane_id(&options.target)
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
 
-    crate::client::run_terminal_session_observe_pane(options.target, options.cols, options.rows)?;
+    crate::client::run_terminal_session_observe_pane(options.target, cols, rows)?;
     Ok(0)
+}
+
+fn exact_pane_observation_dimensions(
+    options: &TerminalSessionOptions,
+) -> std::io::Result<(u16, u16)> {
+    if !options.dimensions_provided {
+        return Ok(crate::protocol::NATIVE_OBSERVATION_DIMENSIONS);
+    }
+    validate_observation_dimensions(options.cols, options.rows)?;
+    Ok((options.cols, options.rows))
 }
 
 fn validate_observation_dimensions(cols: u16, rows: u16) -> std::io::Result<()> {
@@ -613,6 +623,7 @@ struct TerminalSessionOptions {
     cols: u16,
     rows: u16,
     takeover: bool,
+    dimensions_provided: bool,
 }
 
 fn parse_terminal_session_options(
@@ -636,6 +647,7 @@ fn parse_terminal_session_options(
     let mut cols = 120;
     let mut rows = 40;
     let mut takeover = false;
+    let mut dimensions_provided = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -649,6 +661,7 @@ fn parse_terminal_session_options(
                     return Ok(Err(2));
                 };
                 cols = parse_terminal_dimension(value, "--cols")?;
+                dimensions_provided = true;
                 i += 2;
             }
             "--rows" => {
@@ -657,6 +670,7 @@ fn parse_terminal_session_options(
                     return Ok(Err(2));
                 };
                 rows = parse_terminal_dimension(value, "--rows")?;
+                dimensions_provided = true;
                 i += 2;
             }
             "help" | "--help" | "-h" => {
@@ -676,6 +690,7 @@ fn parse_terminal_session_options(
         cols,
         rows,
         takeover,
+        dimensions_provided,
     }))
 }
 
@@ -1257,6 +1272,46 @@ fn _print_json<T: Serialize>(value: &T) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_pane_observation_uses_native_dimensions_when_flags_are_omitted() {
+        let options = super::parse_terminal_session_options(
+            &["w1:p1".to_owned()],
+            "usage",
+            "observe-pane",
+            false,
+        )
+        .expect("parse should succeed")
+        .expect("options should be present");
+
+        assert_eq!(
+            super::exact_pane_observation_dimensions(&options).expect("valid dimensions"),
+            crate::protocol::NATIVE_OBSERVATION_DIMENSIONS
+        );
+    }
+
+    #[test]
+    fn exact_pane_observation_preserves_explicit_fixed_dimensions() {
+        let options = super::parse_terminal_session_options(
+            &[
+                "w1:p1".to_owned(),
+                "--cols".to_owned(),
+                "200".to_owned(),
+                "--rows".to_owned(),
+                "80".to_owned(),
+            ],
+            "usage",
+            "observe-pane",
+            false,
+        )
+        .expect("parse should succeed")
+        .expect("options should be present");
+
+        assert_eq!(
+            super::exact_pane_observation_dimensions(&options).expect("valid dimensions"),
+            (200, 80)
+        );
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(

@@ -24,11 +24,13 @@ pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 /// image payloads that are naturally much larger after base64 encoding.
 pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
 
-/// Exact pane observers use a fixed presentation viewport, never PTY geometry.
+/// Exact pane observers use bounded presentation geometry, never mutate PTY geometry.
 /// These conservative bounds include Fleet's current exact-pane widths with headroom.
 pub const MAX_OBSERVATION_COLS: u16 = 320;
 pub const MAX_OBSERVATION_ROWS: u16 = 120;
 pub const MAX_OBSERVATION_CELLS: usize = 20_000;
+/// Exact observer Hello dimensions requesting the pane runtime's current geometry.
+pub const NATIVE_OBSERVATION_DIMENSIONS: (u16, u16) = (0, 0);
 /// Maximum canonical pane id accepted by the exact observation operation.
 pub const MAX_OBSERVATION_PANE_ID_BYTES: usize = 256;
 /// Public observation bridge records are bounded by the normal terminal frame cap.
@@ -727,6 +729,18 @@ pub fn validate_observation_dimensions(cols: u16, rows: u16) -> Result<(), &'sta
     Ok(())
 }
 
+pub fn uses_native_observation_dimensions(cols: u16, rows: u16) -> bool {
+    (cols, rows) == NATIVE_OBSERVATION_DIMENSIONS
+}
+
+pub fn validate_exact_observer_hello_dimensions(cols: u16, rows: u16) -> Result<(), &'static str> {
+    if uses_native_observation_dimensions(cols, rows) {
+        Ok(())
+    } else {
+        validate_observation_dimensions(cols, rows)
+    }
+}
+
 pub fn validate_observation_pane_id(pane_id: &str) -> Result<(), &'static str> {
     if pane_id.is_empty() {
         return Err("canonical pane id must not be empty");
@@ -1325,20 +1339,33 @@ mod tests {
 
     #[test]
     fn exact_pane_observation_wire_contract_roundtrips() {
-        let hello = ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-            cols: 120,
-            rows: 40,
-            cell_width_px: 0,
-            cell_height_px: 0,
-            requested_encoding: RenderEncoding::TerminalAnsi,
-            keybindings: ClientKeybindings::Server,
-            launch_mode: ClientLaunchMode::TerminalObserve,
-        };
         let request = ClientMessage::ObservePane {
             pane_id: "w_live:p3".to_owned(),
         };
-        for message in [hello, request] {
+        let messages = [
+            ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: NATIVE_OBSERVATION_DIMENSIONS.0,
+                rows: NATIVE_OBSERVATION_DIMENSIONS.1,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalObserve,
+            },
+            ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols: 120,
+                rows: 40,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalObserve,
+            },
+            request,
+        ];
+        for message in messages {
             let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard())
                 .expect("encode exact observation message");
             let (decoded, consumed): (ClientMessage, _) =
@@ -1358,6 +1385,16 @@ mod tests {
         assert_eq!(validate_observation_dimensions(200, 100), Ok(()));
         assert_eq!(validate_observation_dimensions(300, 66), Ok(()));
         assert_eq!(validate_observation_dimensions(320, 62), Ok(()));
+        assert_eq!(
+            validate_exact_observer_hello_dimensions(
+                NATIVE_OBSERVATION_DIMENSIONS.0,
+                NATIVE_OBSERVATION_DIMENSIONS.1,
+            ),
+            Ok(())
+        );
+        assert!(validate_observation_dimensions(0, 0).is_err());
+        assert!(validate_exact_observer_hello_dimensions(0, 40).is_err());
+        assert!(validate_exact_observer_hello_dimensions(120, 0).is_err());
         assert!(validate_observation_dimensions(0, 40).is_err());
         assert!(validate_observation_dimensions(321, 1).is_err());
         assert!(validate_observation_dimensions(1, 121).is_err());

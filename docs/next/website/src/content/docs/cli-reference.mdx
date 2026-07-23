@@ -303,9 +303,12 @@ without taking input, resize, scroll, or takeover authority.
 the current canonical pane ID returned by Herdr, with no terminal ID, agent
 label, alias, stale-ID, or current-pane fallback. The observer is bound to that
 pane, terminal ID, and terminal runtime generation and closes if any identity
-changes. Its dimensions affect only the rendered view and never resize the PTY.
-Dimensions are limited to 320 columns, 120 rows, and 20,000 total cells; the
-default is 120x40. The first `terminal.frame` is full with sequence 1, later
+changes. With neither `--cols` nor `--rows`, it uses the authoritative pane
+runtime dimensions as view-only rendering geometry. If either flag is supplied,
+it keeps fixed geometry; the omitted axis remains at its existing 120-column or
+40-row default. Neither mode resizes the PTY. Dimensions are limited to 320
+columns, 120 rows, and 20,000 total cells and are rejected rather than clamped.
+The first `terminal.frame` is full with sequence 1, later
 frames are contiguous and coalesced when the writer is blocked. Binary wire
 frames and encoded NDJSON records are each limited to 2 MB; ANSI payloads use
 the lower advertised `max_ansi_bytes` limit so base64 and JSON framing fit.

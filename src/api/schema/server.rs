@@ -27,6 +27,9 @@ pub struct TerminalObservationCapabilities {
     pub exact_pane: bool,
     pub read_only: bool,
     pub view_only_dimensions: bool,
+    /// Omitted exact-pane dimensions use the current pane runtime geometry.
+    #[serde(default)]
+    pub native_dimensions: bool,
     pub full_frame_first: bool,
     pub bounded_frames: bool,
     pub coalesced_updates: bool,
@@ -47,6 +50,7 @@ impl TerminalObservationCapabilities {
             exact_pane: true,
             read_only: true,
             view_only_dimensions: true,
+            native_dimensions: true,
             full_frame_first: true,
             bounded_frames: true,
             coalesced_updates: true,
